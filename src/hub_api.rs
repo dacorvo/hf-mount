@@ -146,6 +146,7 @@ struct LfsInfo {
 #[derive(Debug)]
 pub struct HeadFileInfo {
     pub xet_hash: Option<String>,
+    pub etag: Option<String>,
     pub size: Option<u64>,
     pub last_modified: Option<String>,
 }
@@ -433,6 +434,11 @@ impl HubApiClient {
             .get("x-linked-size")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok());
+        let etag = headers
+            .get("x-linked-etag")
+            .or_else(|| headers.get("etag"))
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
         let last_modified = headers
             .get("last-modified")
             .and_then(|v| v.to_str().ok())
@@ -440,6 +446,7 @@ impl HubApiClient {
 
         Ok(Some(HeadFileInfo {
             xet_hash,
+            etag,
             size,
             last_modified,
         }))

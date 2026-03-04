@@ -381,7 +381,7 @@ impl VirtualFs {
     /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
     /// If the file was deleted (404), removes the inode.
     /// On network errors, silently returns (graceful degradation).
-    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: &str) {
+    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_size: u64) {
         // When serve_lookup_from_cache is true, skip HEAD if recently validated.
         // When false (minimal mode), always HEAD on every lookup.
         if self.serve_lookup_from_cache {
@@ -418,15 +418,21 @@ impl VirtualFs {
             }
             Some(head_info) => {
                 let remote_hash = head_info.xet_hash.as_deref();
+                let remote_size = head_info.size.unwrap_or(0);
+                // Detect changes via xet_hash (if available) or size + etag.
+                let changed = if current_hash.is_some() || remote_hash.is_some() {
+                    remote_hash != current_hash
+                } else {
+                    remote_size != current_size
+                };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
-                if remote_hash != Some(current_hash) {
-                    let remote_size = head_info.size.unwrap_or(0);
+                if changed {
                     let remote_mtime = head_info
                         .last_modified
                         .as_deref()
                         .map(HubApiClient::mtime_from_http_date)
                         .unwrap_or(SystemTime::now());
-                    debug!("Remote change detected via HEAD: {} (hash changed)", full_path);
+                    debug!("Remote change detected via HEAD: {}", full_path);
                     inodes.update_remote_file(ino, remote_hash.map(|s| s.to_string()), remote_size, remote_mtime);
                     if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
                         invalidate(ino);
@@ -721,7 +727,8 @@ impl VirtualFs {
             NeedsRevalidation {
                 ino: u64,
                 full_path: String,
-                current_hash: String,
+                current_hash: Option<String>,
+                current_size: u64,
             },
             Miss(String), // full_path for negative cache
             NotLoaded,
@@ -736,13 +743,13 @@ impl VirtualFs {
 
             if parent_entry.children_loaded {
                 if let Some(entry) = inodes.lookup_child(parent, name) {
-                    // Revalidate remote files via HEAD
-                    // Only for non-dirty files that have a remote xet_hash.
-                    if entry.kind == InodeKind::File && !entry.dirty && entry.xet_hash.is_some() {
+                    // Revalidate remote files via HEAD (xet-backed and plain git/LFS).
+                    if entry.kind == InodeKind::File && !entry.dirty {
                         FastResult::NeedsRevalidation {
                             ino: entry.inode,
                             full_path: entry.full_path.clone(),
-                            current_hash: entry.xet_hash.clone().unwrap(),
+                            current_hash: entry.xet_hash.clone(),
+                            current_size: entry.size,
                         }
                     } else {
                         FastResult::Hit(self.make_vfs_attr(entry))
@@ -767,8 +774,10 @@ impl VirtualFs {
                 ino,
                 full_path,
                 current_hash,
+                current_size,
             } => {
-                self.revalidate_file(ino, &full_path, &current_hash).await;
+                self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_size)
+                    .await;
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 return match inodes.get(ino) {
                     Some(entry) => Ok(self.make_vfs_attr(entry)),
