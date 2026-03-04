@@ -174,7 +174,7 @@ pub struct HubApiClient {
 /// "datasets/user/ds" → (Dataset, "user/ds")
 /// "spaces/user/app" → (Space, "user/app")
 /// "user/model" → (Model, "user/model")
-fn parse_repo_id(repo_id: &str) -> (RepoType, String) {
+pub fn parse_repo_id(repo_id: &str) -> (RepoType, String) {
     if let Some(rest) = repo_id.strip_prefix("datasets/") {
         (RepoType::Dataset, rest.to_string())
     } else if let Some(rest) = repo_id.strip_prefix("spaces/") {
@@ -195,20 +195,7 @@ fn make_clients() -> (Client, Client) {
 
 impl HubApiClient {
     /// Create a client from a `SourceKind` (bucket or repo).
-    /// For repos, auto-detects the repo type from the repo_id prefix
-    /// (e.g. "datasets/user/ds" → Dataset, "spaces/user/app" → Space, else Model).
     pub fn from_source(endpoint: &str, token: &str, source: SourceKind) -> Arc<Self> {
-        let source = match source {
-            SourceKind::Repo { repo_id, revision, .. } => {
-                let (repo_type, repo_id) = parse_repo_id(&repo_id);
-                SourceKind::Repo {
-                    repo_id,
-                    repo_type,
-                    revision,
-                }
-            }
-            other => other,
-        };
         let (client, head_client) = make_clients();
         Arc::new(Self {
             client,

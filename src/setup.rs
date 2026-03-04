@@ -7,7 +7,7 @@ use data::data_client::default_config;
 use tracing::info;
 
 use crate::cached_xet_client::CachedXetClient;
-use crate::hub_api::{HubApiClient, HubTokenRefresher, RepoType, SourceKind};
+use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id};
 use crate::virtual_fs::VirtualFs;
 use crate::xet::{StagingDir, XetSessions};
 
@@ -138,14 +138,17 @@ pub fn setup(is_nfs: bool) -> MountSetup {
             repo_id,
             mount_point,
             revision,
-        } => (
-            mount_point,
-            SourceKind::Repo {
-                repo_id,
-                repo_type: RepoType::Model, // overridden by from_source
-                revision,
-            },
-        ),
+        } => {
+            let (repo_type, repo_id) = parse_repo_id(&repo_id);
+            (
+                mount_point,
+                SourceKind::Repo {
+                    repo_id,
+                    repo_type,
+                    revision,
+                },
+            )
+        }
     };
 
     let hub_client = HubApiClient::from_source(&args.hub_endpoint, &args.hf_token, source);
