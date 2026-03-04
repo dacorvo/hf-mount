@@ -20,6 +20,8 @@ pub struct InodeEntry {
     pub size: u64,
     pub mtime: SystemTime,
     pub xet_hash: Option<String>,
+    /// ETag from the last HEAD revalidation (used for non-xet plain git/LFS files).
+    pub etag: Option<String>,
     pub dirty: bool,
     pub children_loaded: bool,
     pub children: Vec<u64>,
@@ -60,6 +62,7 @@ impl InodeTable {
             size: 0,
             mtime: UNIX_EPOCH,
             xet_hash: None,
+            etag: None,
             dirty: false,
             children_loaded: false,
             children: Vec::new(),
@@ -136,6 +139,7 @@ impl InodeTable {
             size,
             mtime,
             xet_hash,
+            etag: None,
             dirty: false,
             children_loaded: kind == InodeKind::File, // files don't have children to load
             children: Vec::new(),
@@ -173,12 +177,22 @@ impl InodeTable {
             .collect()
     }
 
-    /// Snapshot of all file entries: (ino, full_path, xet_hash, size, dirty)
-    pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, u64, bool)> {
+    /// Snapshot of all file entries: (ino, full_path, xet_hash, etag, size, dirty)
+    #[allow(clippy::type_complexity)]
+    pub fn file_snapshot(&self) -> Vec<(u64, String, Option<String>, Option<String>, u64, bool)> {
         self.inodes
             .values()
             .filter(|e| e.kind == InodeKind::File)
-            .map(|e| (e.inode, e.full_path.clone(), e.xet_hash.clone(), e.size, e.dirty))
+            .map(|e| {
+                (
+                    e.inode,
+                    e.full_path.clone(),
+                    e.xet_hash.clone(),
+                    e.etag.clone(),
+                    e.size,
+                    e.dirty,
+                )
+            })
             .collect()
     }
 
@@ -187,6 +201,7 @@ impl InodeTable {
         &mut self,
         ino: u64,
         new_hash: Option<String>,
+        new_etag: Option<String>,
         new_size: u64,
         new_mtime: SystemTime,
     ) -> bool {
@@ -195,6 +210,7 @@ impl InodeTable {
                 return false;
             }
             entry.xet_hash = new_hash;
+            entry.etag = new_etag;
             entry.size = new_size;
             entry.mtime = new_mtime;
             true
@@ -595,12 +611,13 @@ mod tests {
         let a = snapshot.iter().find(|(ino, ..)| *ino == ino1).unwrap();
         assert_eq!(a.1, "a.txt");
         assert_eq!(a.2, Some("hash_a".to_string()));
-        assert_eq!(a.3, 100);
-        assert!(a.4, "a.txt should be dirty");
+        assert_eq!(a.3, None); // etag
+        assert_eq!(a.4, 100);
+        assert!(a.5, "a.txt should be dirty");
 
         let b = snapshot.iter().find(|(ino, ..)| *ino == ino2).unwrap();
         assert_eq!(b.1, "b.txt");
-        assert!(!b.4, "b.txt should not be dirty");
+        assert!(!b.5, "b.txt should not be dirty");
     }
 
     #[test]
@@ -620,7 +637,7 @@ mod tests {
         let new_mtime = UNIX_EPOCH + std::time::Duration::from_secs(1000);
 
         // Update succeeds on non-dirty file
-        assert!(table.update_remote_file(ino, Some("new_hash".to_string()), 200, new_mtime));
+        assert!(table.update_remote_file(ino, Some("new_hash".to_string()), None, 200, new_mtime));
         let entry = table.get(ino).unwrap();
         assert_eq!(entry.xet_hash, Some("new_hash".to_string()));
         assert_eq!(entry.size, 200);
@@ -628,11 +645,11 @@ mod tests {
 
         // Mark dirty — update should fail
         table.get_mut(ino).unwrap().dirty = true;
-        assert!(!table.update_remote_file(ino, Some("ignored".to_string()), 999, UNIX_EPOCH));
+        assert!(!table.update_remote_file(ino, Some("ignored".to_string()), None, 999, UNIX_EPOCH));
         assert_eq!(table.get(ino).unwrap().size, 200, "dirty file should not be updated");
 
         // Non-existent inode
-        assert!(!table.update_remote_file(9999, None, 0, UNIX_EPOCH));
+        assert!(!table.update_remote_file(9999, None, None, 0, UNIX_EPOCH));
     }
 
     #[test]

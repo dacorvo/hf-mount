@@ -1,4 +1,5 @@
 use std::ffi::OsStr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -7,6 +8,7 @@ use fuser::{
     OpenFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
     Request, TimeOrNow,
 };
+use tracing::{error, info};
 
 use crate::inode::InodeKind;
 use crate::virtual_fs::{VirtualFs, VirtualFsAttr};
@@ -376,5 +378,127 @@ impl Filesystem for FuseAdapter {
     /// Called on unmount. Flushes pending writes and stops background tasks.
     fn destroy(&mut self) {
         self.virtual_fs.shutdown();
+    }
+}
+
+/// Mount the VFS as a FUSE filesystem and block until unmount.
+pub fn mount_fuse(
+    virtual_fs: Arc<VirtualFs>,
+    mount_point: &Path,
+    metadata_ttl: Duration,
+    read_only: bool,
+    advanced_writes: bool,
+    max_threads: usize,
+    runtime: &tokio::runtime::Runtime,
+) {
+    let adapter = FuseAdapter::new(
+        runtime.handle().clone(),
+        virtual_fs.clone(),
+        metadata_ttl,
+        read_only,
+        advanced_writes,
+    );
+
+    let mut config = fuser::Config::default();
+    config.mount_options = vec![
+        fuser::MountOption::FSName("hf-mount".to_string()),
+        fuser::MountOption::DefaultPermissions,
+    ];
+    if read_only {
+        config.mount_options.push(fuser::MountOption::RO);
+    }
+    config.acl = fuser::SessionACL::All;
+    config.clone_fd = true;
+    config.n_threads = Some(max_threads);
+
+    let session = match fuser::Session::new(adapter, mount_point, &config) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("FUSE session failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let notifier = session.notifier();
+    virtual_fs.set_invalidator(Box::new(move |ino| {
+        if let Err(e) = notifier.inval_inode(fuser::INodeNo(ino), 0, -1) {
+            tracing::debug!("inval_inode({}) failed: {}", ino, e);
+        }
+    }));
+    let bg = match session.spawn() {
+        Ok(bg) => bg,
+        Err(e) => {
+            error!("FUSE spawn failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Catch SIGINT/SIGTERM and trigger a clean unmount instead of letting
+    // the default handler kill the process (which leaves a stale mount).
+    let mp = mount_point.to_path_buf();
+    runtime.spawn(async move {
+        wait_for_signal().await;
+        info!("Received signal, unmounting...");
+        unmount_fuse(&mp);
+    });
+
+    let _ = bg.join();
+}
+
+/// Wait for SIGINT or SIGTERM.
+async fn wait_for_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+/// Trigger FUSE unmount. Uses libc as primary method (no external process
+/// dependency), then falls back to fusermount/umount. If all fail, force-exits
+/// to avoid hanging (tokio's signal handler replaces the default one, so
+/// bg.join() would block forever if unmount fails).
+fn unmount_fuse(mount_point: &Path) {
+    use std::ffi::CString;
+
+    let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
+
+    // Try libc unmount first (like mountpoint-s3).
+    if let Some(ref c_path) = c_path {
+        #[cfg(target_os = "linux")]
+        {
+            // MNT_DETACH: lazy unmount, detaches immediately.
+            if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
+                return;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            // MNT_FORCE: force unmount even with open files.
+            if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
+                return;
+            }
+        }
+    }
+
+    // Fallback: external command. Try fusermount3 first (FUSE3), then fusermount.
+    #[cfg(target_os = "linux")]
+    let cmd_ok = std::process::Command::new("fusermount3")
+        .args(["-u", "-z", &mount_point.to_string_lossy()])
+        .status()
+        .is_ok_and(|s| s.success())
+        || std::process::Command::new("fusermount")
+            .args(["-u", "-z", &mount_point.to_string_lossy()])
+            .status()
+            .is_ok_and(|s| s.success());
+    #[cfg(target_os = "macos")]
+    let cmd_ok = std::process::Command::new("umount")
+        .arg(mount_point)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    if !cmd_ok {
+        error!("Failed to unmount {:?}, forcing exit", mount_point);
+        std::process::exit(1);
     }
 }
