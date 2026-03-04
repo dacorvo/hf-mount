@@ -1018,9 +1018,16 @@ impl VirtualFs {
                     libc::EIO
                 })?;
                 let mtime_ms = fe.mtime.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+                let path_hash = {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    self.hub_client.source().to_string().hash(&mut h);
+                    fe.full_path.hash(&mut h);
+                    h.finish()
+                };
                 let dest = staging
                     .root()
-                    .join(format!("http_{:x}_s{}_t{}", ino, fe.size, mtime_ms));
+                    .join(format!("http_{:x}_s{}_t{}", path_hash, fe.size, mtime_ms));
                 if !dest.exists() {
                     let lock = self.staging_lock(ino);
                     let _guard = lock.lock().await;
