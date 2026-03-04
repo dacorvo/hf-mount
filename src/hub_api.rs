@@ -206,6 +206,48 @@ impl HubApiClient {
         })
     }
 
+    /// Resolve repo aliases (e.g. "gpt2" → "openai-community/gpt2").
+    /// The Hub 307-redirects short names on most endpoints, but some (like
+    /// xet-read-token) return 404 instead. Call this once at startup to
+    /// canonicalize the repo ID.
+    pub async fn resolve_repo_id(&self) -> Result<Option<Arc<Self>>> {
+        let (repo_id, repo_type, revision) = match &self.source {
+            SourceKind::Repo {
+                repo_id,
+                repo_type,
+                revision,
+            } => (repo_id.clone(), *repo_type, revision.clone()),
+            _ => return Ok(None),
+        };
+
+        let url = format!("{}/api/{}/{}", self.endpoint, repo_type.api_prefix(), repo_id,);
+        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
+        if !resp.status().is_success() {
+            return Err(Error::Hub(format!(
+                "Failed to resolve repo {}: {} {}",
+                repo_id,
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            )));
+        }
+        let body: serde_json::Value = resp.json().await?;
+        let resolved_id = body["id"]
+            .as_str()
+            .ok_or_else(|| Error::Hub("repo info missing 'id' field".to_string()))?;
+
+        if resolved_id == repo_id {
+            return Ok(None);
+        }
+
+        info!("Resolved repo alias: {} → {}", repo_id, resolved_id);
+        let new_source = SourceKind::Repo {
+            repo_id: resolved_id.to_string(),
+            repo_type,
+            revision,
+        };
+        Ok(Some(Self::from_source(&self.endpoint, &self.token, new_source)))
+    }
+
     /// Create a client for a HuggingFace bucket.
     pub fn new(endpoint: &str, token: &str, bucket_id: &str) -> Arc<Self> {
         let (client, head_client) = make_clients();

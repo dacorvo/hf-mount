@@ -153,6 +153,17 @@ pub fn setup(is_nfs: bool) -> MountSetup {
 
     let hub_client = HubApiClient::from_source(&args.hub_endpoint, &args.hf_token, source);
 
+    // Resolve repo aliases (e.g. "gpt2" → "openai-community/gpt2")
+    let hub_client = runtime.block_on(async {
+        match hub_client.resolve_repo_id().await {
+            Ok(Some(resolved)) => resolved,
+            Ok(None) => hub_client,
+            Err(e) => {
+                panic!("Failed to resolve repo ID: {}", e);
+            }
+        }
+    });
+
     let read_only = args.read_only || hub_client.is_repo();
     if hub_client.is_repo() && !args.read_only {
         info!("Repo mounts are always read-only");
