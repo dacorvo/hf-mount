@@ -1028,22 +1028,18 @@ impl VirtualFs {
                 let dest = staging
                     .root()
                     .join(format!("http_{:x}_s{}_t{}", path_hash, fe.size, mtime_ms));
-                // When mtime is unknown (repos don't expose it in tree listings),
-                // always re-download to avoid serving stale content. These are
-                // small files (config.json, README.md); large files use xet/CAS.
-                let cacheable = mtime_ms > 0;
-                if !cacheable || !dest.exists() {
+                {
                     let lock = self.staging_lock(ino);
                     let _guard = lock.lock().await;
-                    if !cacheable || !dest.exists() {
-                        self.hub_client
-                            .download_file_http(&fe.full_path, &dest)
-                            .await
-                            .map_err(|e| {
-                                error!("HTTP download failed for {}: {}", fe.full_path, e);
-                                libc::EIO
-                            })?;
-                    }
+                    // download_file_http uses ETag-based conditional requests,
+                    // so this is cheap when the cached file is still valid (304).
+                    self.hub_client
+                        .download_file_http(&fe.full_path, &dest)
+                        .await
+                        .map_err(|e| {
+                            error!("HTTP download failed for {}: {}", fe.full_path, e);
+                            libc::EIO
+                        })?;
                 }
                 self.open_local_readonly(ino, &dest)
             }

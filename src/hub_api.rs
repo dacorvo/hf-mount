@@ -519,6 +519,10 @@ impl HubApiClient {
 
     /// Download a file via HTTP GET on the resolve endpoint and write it to `dest`.
     /// Used for plain LFS / plain git files in repos (no xet hash).
+    ///
+    /// Supports ETag-based conditional requests: if `dest` already exists and a
+    /// sidecar `{dest}.etag` file is present, sends `If-None-Match`. On 304 the
+    /// existing cached file is kept as-is.
     pub async fn download_file_http(&self, path: &str, dest: &Path) -> Result<()> {
         let url = match &self.source {
             SourceKind::Bucket { bucket_id } => {
@@ -540,9 +544,26 @@ impl HubApiClient {
             }
         };
 
-        info!("HTTP download: {} → {:?}", path, dest);
+        // Read cached ETag if present.
+        let etag_path = dest.with_extension("etag");
+        let cached_etag = if dest.exists() {
+            std::fs::read_to_string(&etag_path).ok()
+        } else {
+            None
+        };
 
-        let resp = self.client.get(&url).bearer_auth(&self.token).send().await?;
+        let mut req = self.client.get(&url).bearer_auth(&self.token);
+        if let Some(ref etag) = cached_etag {
+            req = req.header("If-None-Match", etag.trim());
+        }
+
+        info!("HTTP download: {} → {:?}", path, dest);
+        let resp = req.send().await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            info!("HTTP cache hit (304): {}", path);
+            return Ok(());
+        }
 
         if !resp.status().is_success() {
             return Err(Error::Hub(format!(
@@ -553,8 +574,13 @@ impl HubApiClient {
             )));
         }
 
+        let new_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
         // Stream response body to a temp file, then atomic-rename to dest.
-        // This prevents partial/corrupt files from being served after interrupted downloads.
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -570,6 +596,9 @@ impl HubApiClient {
             file.shutdown().await?;
             drop(file);
             tokio::fs::rename(&tmp, dest).await?;
+            if let Some(etag) = &new_etag {
+                tokio::fs::write(&etag_path, etag).await.ok();
+            }
             Ok(())
         }
         .await;
