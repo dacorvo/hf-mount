@@ -258,7 +258,7 @@ impl VirtualFs {
                 let mut inode_table = inodes.write().expect("inodes poisoned");
 
                 for update in &updates {
-                    inode_table.update_remote_file(update.ino, update.hash.clone(), update.size, update.mtime);
+                    inode_table.update_remote_file(update.ino, update.hash.clone(), None, update.size, update.mtime);
                     inos_to_invalidate.push(update.ino);
                 }
 
@@ -381,7 +381,7 @@ impl VirtualFs {
     /// If the file's xet_hash changed, updates the inode and invalidates kernel cache.
     /// If the file was deleted (404), removes the inode.
     /// On network errors, silently returns (graceful degradation).
-    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_size: u64) {
+    async fn revalidate_file(&self, ino: u64, full_path: &str, current_hash: Option<&str>, current_etag: Option<&str>) {
         // When serve_lookup_from_cache is true, skip HEAD if recently validated.
         // When false (minimal mode), always HEAD on every lookup.
         if self.serve_lookup_from_cache {
@@ -418,12 +418,13 @@ impl VirtualFs {
             }
             Some(head_info) => {
                 let remote_hash = head_info.xet_hash.as_deref();
+                let remote_etag = head_info.etag.as_deref();
                 let remote_size = head_info.size.unwrap_or(0);
-                // Detect changes via xet_hash (if available) or size + etag.
+                // Detect changes via xet_hash (preferred) or ETag.
                 let changed = if current_hash.is_some() || remote_hash.is_some() {
                     remote_hash != current_hash
                 } else {
-                    remote_size != current_size
+                    remote_etag != current_etag
                 };
                 let mut inodes = self.inode_table.write().expect("inodes poisoned");
                 if changed {
@@ -433,9 +434,23 @@ impl VirtualFs {
                         .map(HubApiClient::mtime_from_http_date)
                         .unwrap_or(SystemTime::now());
                     debug!("Remote change detected via HEAD: {}", full_path);
-                    inodes.update_remote_file(ino, remote_hash.map(|s| s.to_string()), remote_size, remote_mtime);
+                    inodes.update_remote_file(
+                        ino,
+                        remote_hash.map(|s| s.to_string()),
+                        remote_etag.map(|s| s.to_string()),
+                        remote_size,
+                        remote_mtime,
+                    );
                     if let Some(invalidate) = self.invalidator.lock().expect("invalidator poisoned").as_ref() {
                         invalidate(ino);
+                    }
+                } else {
+                    // Update stored etag even when content didn't change,
+                    // so future revalidations have the latest value.
+                    if let Some(entry) = inodes.get_mut(ino)
+                        && remote_etag.is_some()
+                    {
+                        entry.etag = remote_etag.map(|s| s.to_string());
                     }
                 }
                 // Stamp revalidation time regardless of whether content changed
@@ -728,7 +743,7 @@ impl VirtualFs {
                 ino: u64,
                 full_path: String,
                 current_hash: Option<String>,
-                current_size: u64,
+                current_etag: Option<String>,
             },
             Miss(String), // full_path for negative cache
             NotLoaded,
@@ -749,7 +764,7 @@ impl VirtualFs {
                             ino: entry.inode,
                             full_path: entry.full_path.clone(),
                             current_hash: entry.xet_hash.clone(),
-                            current_size: entry.size,
+                            current_etag: entry.etag.clone(),
                         }
                     } else {
                         FastResult::Hit(self.make_vfs_attr(entry))
@@ -774,9 +789,9 @@ impl VirtualFs {
                 ino,
                 full_path,
                 current_hash,
-                current_size,
+                current_etag,
             } => {
-                self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_size)
+                self.revalidate_file(ino, &full_path, current_hash.as_deref(), current_etag.as_deref())
                     .await;
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 return match inodes.get(ino) {
