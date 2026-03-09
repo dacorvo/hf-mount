@@ -924,9 +924,9 @@ fn open_simple_no_truncate_eperm() {
     });
 }
 
-/// setattr(size) in simple mode returns EPERM (truncation not supported).
+/// setattr(size) in simple mode is a silent noop (size unchanged).
 #[test]
-fn setattr_simple_mode_eperm() {
+fn setattr_simple_mode_noop() {
     let hub = MockHub::new();
     hub.add_file("file.txt", 100, Some("hash1"), None);
     let xet = MockXet::new();
@@ -935,7 +935,31 @@ fn setattr_simple_mode_eperm() {
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.txt").await.unwrap();
         let result = vfs.setattr(attr.ino, Some(50), None, None, None, None, None).await;
-        assert_eq!(result.unwrap_err(), libc::EPERM);
+        assert!(result.is_ok(), "ftruncate should succeed (noop)");
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(attr.ino).unwrap();
+        assert_eq!(entry.size, 100, "size should be unchanged (noop)");
+    });
+}
+
+/// setattr(size) on an empty file in simple mode is a silent noop.
+#[test]
+fn setattr_simple_mode_empty_file_noop() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+    let (rt, vfs) = vfs_simple(&hub, &xet);
+
+    rt.block_on(async {
+        let (attr, _fh) = vfs
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, Some(1))
+            .await
+            .unwrap();
+        // ftruncate(fd, N) in simple mode succeeds but is a noop
+        let result = vfs.setattr(attr.ino, Some(100), None, None, None, None, None).await;
+        assert!(result.is_ok(), "ftruncate should succeed (noop): {:?}", result);
+        let inodes = vfs.inode_table.read().unwrap();
+        let entry = inodes.get(attr.ino).unwrap();
+        assert_eq!(entry.size, 0, "size should be unchanged (noop)");
     });
 }
 

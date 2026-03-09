@@ -2592,30 +2592,25 @@ impl VirtualFs {
             return Err(libc::EROFS);
         }
 
-        // Simple mode: truncation is not supported via setattr. O_TRUNC opens
-        // go through open() directly (FUSE_ATOMIC_O_TRUNC is negotiated).
-        // Non-zero truncation requires staging files (advanced_writes mode).
-        if size.is_some() && !self.advanced_writes {
-            return Err(libc::EPERM);
-        }
-
-        // Validate inode exists and is a file before any side effects
-        {
-            let inodes = self.inode_table.read().expect("inodes poisoned");
-            match inodes.get(ino) {
-                Some(e) if size.is_some() && e.kind != InodeKind::File => return Err(libc::EISDIR),
-                Some(_) => {}
-                None => return Err(libc::ENOENT),
-            }
-        }
-
         if let Some(new_size) = size {
-            // Serialize with open() staging preparation on the same inode
-            let staging_mutex = self.staging_lock(ino);
-            let _staging_guard = staging_mutex.lock().await;
+            // Validate inode exists and is a file before any side effects
+            {
+                let inodes = self.inode_table.read().expect("inodes poisoned");
+                match inodes.get(ino) {
+                    Some(e) if e.kind != InodeKind::File => return Err(libc::EISDIR),
+                    None => return Err(libc::ENOENT),
+                    _ => {}
+                }
+            }
 
-            if self.advanced_writes {
+            if !self.advanced_writes {
+                // Simple mode: ftruncate via setattr is silently ignored.
+                // Real truncation goes through open(O_TRUNC) which is handled separately.
+            } else {
                 // Advanced mode: truncation is applied to the staging file on disk
+                let staging_mutex = self.staging_lock(ino);
+                let _staging_guard = staging_mutex.lock().await;
+
                 let staging_path = self
                     .staging_dir
                     .as_ref()
@@ -2658,24 +2653,23 @@ impl VirtualFs {
                         return Err(libc::EIO);
                     }
                 }
-            }
-            // Advanced mode only past this point (simple mode returns EPERM above).
 
-            let mut inodes = self.inode_table.write().expect("inodes poisoned");
-            if let Some(entry) = inodes.get_mut(ino) {
-                entry.size = new_size;
-                entry.mtime = SystemTime::now();
-                entry.ctime = entry.mtime;
-                entry.dirty = true;
-                if new_size == 0 {
-                    entry.xet_hash = None;
+                let mut inodes = self.inode_table.write().expect("inodes poisoned");
+                if let Some(entry) = inodes.get_mut(ino) {
+                    entry.size = new_size;
+                    entry.mtime = SystemTime::now();
+                    entry.ctime = entry.mtime;
+                    entry.dirty = true;
+                    if new_size == 0 {
+                        entry.xet_hash = None;
+                    }
                 }
-            }
 
-            // Schedule flush so the truncation is committed to CAS/bucket
-            drop(inodes);
-            if let Some(fm) = &self.flush_manager {
-                fm.enqueue(ino);
+                // Schedule flush so the truncation is committed to CAS/bucket
+                drop(inodes);
+                if let Some(fm) = &self.flush_manager {
+                    fm.enqueue(ino);
+                }
             }
         }
 

@@ -163,10 +163,11 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
-                // KEEP_CACHE preserves the kernel page cache across re-opens.
-                // The poll loop calls notify_inval_inode on remote changes;
-                // the short metadata TTL handles local change visibility.
-                reply.opened(FileHandle(file_handle), FopenFlags::FOPEN_KEEP_CACHE);
+                // No FOPEN_KEEP_CACHE: the kernel invalidates the page cache on
+                // each open(), ensuring fresh data from the remote. Remote changes
+                // are also proactively invalidated via notify_inval_inode in the
+                // poll loop.
+                reply.opened(FileHandle(file_handle), FopenFlags::empty());
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -525,7 +526,7 @@ fn unmount_fuse(mount_point: &Path) {
 
     let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
 
-    // Try libc unmount first (like mountpoint-s3).
+    // Try libc unmount first.
     if let Some(ref c_path) = c_path {
         #[cfg(target_os = "linux")]
         {
