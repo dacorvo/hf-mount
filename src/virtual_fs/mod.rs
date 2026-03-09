@@ -12,10 +12,12 @@ use tracing::{debug, error, info, warn};
 
 use crate::hub_api::{BatchOp, HubOps};
 
+mod flush;
 pub mod inode;
-use crate::prefetch::{FetchPlan, PrefetchState};
+mod prefetch;
 use crate::xet::{StagingDir, StreamingWriterOps, XetOps};
 use inode::{InodeEntry, InodeKind, InodeTable};
+use prefetch::{FetchPlan, PrefetchState};
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -62,7 +64,7 @@ pub struct VirtualFs {
     /// open() awaits it instead of blindly blocking on staging_lock.
     pending_commits: Mutex<HashMap<u64, CommitHookRx>>,
     /// Debounced batch flush pipeline (None when read_only).
-    flush_manager: Option<crate::flush::FlushManager>,
+    flush_manager: Option<flush::FlushManager>,
     /// Background poll task handle, taken in shutdown().
     poll_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Kernel cache invalidation callback. Set via `set_invalidator()` after mount.
@@ -109,7 +111,7 @@ impl VirtualFs {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
-            Some(crate::flush::FlushManager::new(
+            Some(flush::FlushManager::new(
                 xet_sessions.clone(),
                 sd.clone(),
                 hub_client.clone(),
@@ -1705,7 +1707,7 @@ impl VirtualFs {
         Ok(())
     }
 
-    pub async fn release(&self, file_handle: u64) {
+    pub async fn release(&self, file_handle: u64) -> VirtualFsResult<()> {
         debug!("release: fh={}", file_handle);
 
         let removed = self
@@ -1719,11 +1721,14 @@ impl VirtualFs {
             _ => None,
         };
 
+        let mut release_error: Option<i32> = None;
+
         match removed {
             Some(OpenFile::Local {
                 ino, writable: true, ..
             }) => {
-                // Advanced writes: enqueue for async flush (skip unlinked files)
+                // Advanced writes: enqueue for async flush (skip unlinked files —
+                // user deleted the file, no point uploading it to remote).
                 let is_unlinked = self
                     .inode_table
                     .read()
@@ -1751,7 +1756,7 @@ impl VirtualFs {
                         Err(e) => {
                             // Retry only if CAS upload succeeded but Hub commit failed
                             // (pending_info is preserved). If the worker itself died,
-                            // there's nothing to retry — the data is gone.
+                            // there's nothing to retry -- the data is gone.
                             if channel.pending_info.lock().unwrap().is_some() {
                                 tokio::time::sleep(Duration::from_secs(1)).await;
                                 self.streaming_commit(ino, &channel).await
@@ -1766,9 +1771,10 @@ impl VirtualFs {
                             *channel.state.lock().unwrap() = CommitState::Committed;
                         }
                         Err(e) => {
-                            error!("data loss: streaming commit failed for ino={}: errno={}", ino, e);
+                            error!("DATA LOSS: streaming commit failed for ino={}: errno={}", ino, e);
                             self.revert_inode(ino, &channel.snapshot);
                             *channel.state.lock().unwrap() = CommitState::Failed("commit failed".into());
+                            release_error = Some(*e);
                         }
                     }
 
@@ -1789,6 +1795,11 @@ impl VirtualFs {
         // staging_locks entries are intentionally not cleaned up here: removing
         // while another open() may hold the Arc would break serialization.
         // Entries are tiny (Arc<Mutex<()>>) and bounded by unique inodes opened.
+
+        match release_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Revert an inode to its pre-write state after a failed streaming commit.
@@ -1814,7 +1825,8 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
-        // POSIX: unlinked files (nlink=0) must not be re-committed on close
+        // Unlinked files (nlink=0) must not be re-committed on close —
+        // user deleted the file, uploading would resurrect it.
         if self
             .inode_table
             .read()

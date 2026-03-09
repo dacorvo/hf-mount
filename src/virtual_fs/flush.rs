@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::hub_api::{BatchOp, HubOps};
-use crate::virtual_fs::inode::InodeTable;
 use crate::xet::{StagingDir, XetOps};
+
+use super::inode::InodeTable;
 
 type FlushRequest = u64;
 
@@ -166,7 +167,7 @@ async fn flush_batch(
 
     debug!("flush_batch: deduped inos = {:?}", deduped);
 
-    // Resolve paths from inode table, skip deleted/non-dirty inodes
+    // Resolve paths from inode table, skip deleted/non-dirty/unlinked inodes
     let to_flush: Vec<(u64, String, PathBuf, Vec<String>)> = {
         let inode_table = inodes.read().expect("inodes poisoned");
         deduped
@@ -255,18 +256,32 @@ async fn flush_batch(
 
     ops.append(&mut delete_ops);
 
-    // Single batch commit
+    // Single batch commit (retry once on transient failure since CAS upload already succeeded).
+    // Note: the retry reuses the original ops without re-reading inode state. In theory a
+    // rename/unlink could happen during the 2s window, but that's extremely unlikely and
+    // the next flush cycle would correct it anyway.
     if let Err(e) = hub_client.batch_operations(&ops).await {
-        error!("Batch commit failed: {}", e);
-        let msg = format!("commit failed: {e}");
-        let mut errs = flush_errors.lock().expect("flush_errors poisoned");
-        for (ino, _, _, _) in &to_flush {
-            errs.insert(*ino, msg.clone());
+        error!("Batch commit failed, retrying in 2s: {}", e);
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        if let Err(e2) = hub_client.batch_operations(&ops).await {
+            error!("Batch commit retry failed: {}", e2);
+            let msg = format!("commit failed after retry: {e2}");
+            let mut errs = flush_errors.lock().expect("flush_errors poisoned");
+            for (ino, _, _, _) in &to_flush {
+                errs.insert(*ino, msg.clone());
+            }
+            // Files remain dirty -- will be re-uploaded on next flush or shutdown
+            return;
         }
-        return;
+        info!("Batch commit retry succeeded");
     }
 
-    // Update inodes
+    // Update inodes.
+    // BUG: setting dirty=false unconditionally can lose writes from a concurrent
+    // writable handle on the same inode. If handle A flushes and clears dirty,
+    // handle B's subsequent release sees !dirty and skips the flush. Fix requires
+    // a dirty generation counter instead of a bool.
     let mut inode_table = inodes.write().expect("inodes poisoned");
     let now = SystemTime::now();
     for (ino, xet_hash, size) in successes {

@@ -260,8 +260,10 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.runtime.block_on(self.virtual_fs.release(fh.0));
-        reply.ok();
+        match self.runtime.block_on(self.virtual_fs.release(fh.0)) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     /// Create and open a new file in one call (O_CREAT).
@@ -534,33 +536,48 @@ pub fn mount_fuse(
         }
     };
 
-    // Catch SIGINT/SIGTERM and trigger a clean unmount instead of letting
-    // the default handler kill the process (which leaves a stale mount).
+    // Catch SIGINT/SIGTERM and trigger a clean unmount. On success, fuser
+    // calls destroy() which runs shutdown(). On failure, we flush here before
+    // exiting so dirty data is not silently lost.
+    // We intentionally do NOT call shutdown() before unmount: FUSE is still
+    // live, so other processes could write to staging files during the flush,
+    // causing CAS to upload a mid-write snapshot.
+    let vfs_for_signal = virtual_fs.clone();
     let mp = mount_point.to_path_buf();
     runtime.spawn(async move {
         wait_for_signal().await;
         info!("Received signal, unmounting...");
-        unmount_fuse(&mp);
+        if !unmount_fuse(&mp) {
+            // Unmount failed -- flush dirty data before force-exiting so we
+            // don't silently lose writes.
+            error!("Unmount failed, flushing dirty files before exit...");
+            vfs_for_signal.shutdown();
+            std::process::exit(1);
+        }
     });
 
     let _ = bg.join();
+    // Safety net: flush after FUSE session ends. Covers external unmount
+    // (e.g. `fusermount -u`) where destroy() may not fire. Idempotent
+    // because shutdown() takes handles from Mutex<Option<...>>.
+    virtual_fs.shutdown();
 }
 
-/// Wait for SIGINT or SIGTERM.
+/// Wait for SIGINT, SIGTERM, or SIGHUP.
 async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to register SIGTERM handler");
+    let mut sighup = signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = sigterm.recv() => {}
+        _ = sighup.recv() => {}
     }
 }
 
-/// Trigger FUSE unmount. Uses libc as primary method (no external process
-/// dependency), then falls back to fusermount/umount. If all fail, force-exits
-/// to avoid hanging (tokio's signal handler replaces the default one, so
-/// bg.join() would block forever if unmount fails).
-fn unmount_fuse(mount_point: &Path) {
+/// Trigger FUSE unmount. Returns `true` on success. Uses libc as primary
+/// method (no external process dependency), then falls back to fusermount/umount.
+fn unmount_fuse(mount_point: &Path) -> bool {
     use std::ffi::CString;
 
     let c_path = CString::new(mount_point.to_string_lossy().as_bytes()).ok();
@@ -571,14 +588,14 @@ fn unmount_fuse(mount_point: &Path) {
         {
             // MNT_DETACH: lazy unmount, detaches immediately.
             if unsafe { libc::umount2(c_path.as_ptr(), libc::MNT_DETACH) } == 0 {
-                return;
+                return true;
             }
         }
         #[cfg(target_os = "macos")]
         {
             // MNT_FORCE: force unmount even with open files.
             if unsafe { libc::unmount(c_path.as_ptr(), libc::MNT_FORCE) } == 0 {
-                return;
+                return true;
             }
         }
     }
@@ -600,7 +617,8 @@ fn unmount_fuse(mount_point: &Path) {
         .is_ok_and(|s| s.success());
 
     if !cmd_ok {
-        error!("Failed to unmount {:?}, forcing exit", mount_point);
-        std::process::exit(1);
+        error!("Failed to unmount {:?}", mount_point);
+        return false;
     }
+    true
 }
