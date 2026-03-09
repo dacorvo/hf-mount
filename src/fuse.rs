@@ -24,6 +24,8 @@ pub struct FuseAdapter {
     metadata_ttl: Duration,
     read_only: bool,
     advanced_writes: bool,
+    /// FOPEN_DIRECT_IO flag on open/create, bypassing kernel page cache.
+    direct_io: bool,
 }
 
 impl FuseAdapter {
@@ -33,6 +35,7 @@ impl FuseAdapter {
         metadata_ttl: Duration,
         read_only: bool,
         advanced_writes: bool,
+        direct_io: bool,
     ) -> Self {
         Self {
             runtime,
@@ -40,6 +43,15 @@ impl FuseAdapter {
             metadata_ttl,
             read_only,
             advanced_writes,
+            direct_io,
+        }
+    }
+
+    fn open_flags(&self) -> FopenFlags {
+        if self.direct_io {
+            FopenFlags::FOPEN_DIRECT_IO
+        } else {
+            FopenFlags::empty()
         }
     }
 }
@@ -92,6 +104,16 @@ impl Filesystem for FuseAdapter {
         // and rely on our userspace PrefetchState instead.
         let _ = config.set_max_readahead(16 * 1_048_576); // 16 MiB
         let _ = config.set_max_write(16 * 1_048_576); // 16 MiB — fewer round-trips for large sequential writes
+
+        // Allow mmap on DIRECT_IO files (Linux 6.6+). Without this, mmap()
+        // returns EINVAL when FOPEN_DIRECT_IO is set, breaking safetensors and
+        // other memory-mapped readers.
+        if self.direct_io && config.add_capabilities(InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP).is_err() {
+            info!(
+                "--direct-io: kernel does not support FUSE_DIRECT_IO_ALLOW_MMAP; \
+                 mmap-based readers (e.g. safetensors) may fail with EINVAL"
+            );
+        }
 
         // Receive O_TRUNC in open() flags instead of a separate setattr(size=0) call.
         if !self.read_only {
@@ -163,11 +185,17 @@ impl Filesystem for FuseAdapter {
             .block_on(self.virtual_fs.open(ino.0, writable, truncate, Some(req.pid())))
         {
             Ok(file_handle) => {
-                // No FOPEN_KEEP_CACHE: the kernel invalidates the page cache on
-                // each open(), ensuring fresh data from the remote. Remote changes
-                // are also proactively invalidated via notify_inval_inode in the
-                // poll loop.
-                reply.opened(FileHandle(file_handle), FopenFlags::empty());
+                // Skip DIRECT_IO only for O_RDWR in simple streaming mode:
+                // streaming handles don't support read(), so DIRECT_IO would
+                // surface EBADF on any read attempt. O_WRONLY and read-only
+                // opens are fine.
+                let rdwr = accmode == libc::O_RDWR;
+                let flags = if rdwr && !self.advanced_writes {
+                    FopenFlags::empty()
+                } else {
+                    self.open_flags()
+                };
+                reply.opened(FileHandle(file_handle), flags);
             }
             Err(e) => reply.error(Errno::from_i32(e)),
         }
@@ -244,7 +272,7 @@ impl Filesystem for FuseAdapter {
         name: &OsStr,
         mode: u32,
         umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         let name = os_to_str!(name, reply);
@@ -258,12 +286,20 @@ impl Filesystem for FuseAdapter {
             Some(req.pid()),
         )) {
             Ok((attr, file_handle)) => {
+                // Same guard as open(): skip DIRECT_IO for O_RDWR in simple
+                // streaming mode (handle is write-only, reads would EBADF).
+                let rdwr = (flags & libc::O_ACCMODE) == libc::O_RDWR;
+                let oflags = if rdwr && !self.advanced_writes {
+                    FopenFlags::empty()
+                } else {
+                    self.open_flags()
+                };
                 reply.created(
                     &self.metadata_ttl,
                     &vfs_attr_to_fuse(&attr),
                     GENERATION,
                     FileHandle(file_handle),
-                    FopenFlags::empty(),
+                    oflags,
                 );
             }
             Err(e) => reply.error(Errno::from_i32(e)),
@@ -437,12 +473,14 @@ impl Filesystem for FuseAdapter {
 }
 
 /// Mount the VFS as a FUSE filesystem and block until unmount.
+#[allow(clippy::too_many_arguments)]
 pub fn mount_fuse(
     virtual_fs: Arc<VirtualFs>,
     mount_point: &Path,
     metadata_ttl: Duration,
     read_only: bool,
     advanced_writes: bool,
+    direct_io: bool,
     max_threads: usize,
     runtime: &tokio::runtime::Runtime,
 ) {
@@ -452,6 +490,7 @@ pub fn mount_fuse(
         metadata_ttl,
         read_only,
         advanced_writes,
+        direct_io,
     );
 
     let mut config = fuser::Config::default();
