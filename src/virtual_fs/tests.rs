@@ -2258,85 +2258,51 @@ fn shutdown_flushes_dirty() {
     assert!(!logs.is_empty());
 }
 
-// ── Reconstruction cache warm-up tests ──────────────────────────────
-
-/// `open()` must trigger exactly one `warm_reconstruction_cache` call per file handle,
-/// and that call must complete before the first `read()` is served.
-///
-/// We inject a 50 ms delay into the warm call to ensure the warm task is still
-/// running when `read()` is called.  If `read()` did NOT wait for the watch, the
-/// first read would race with the warm task and the assertion on `warm_call_count`
-/// at read time might pass trivially — so we also verify timing:
-///   - with the warm delay the first read takes ≥ 50 ms (waited for warm)
-///   - subsequent reads on the same handle take < 10 ms (watch already true)
-///   - a second `open()` on the same inode triggers a second warm call.
+/// Sequential reads should pass `end=None` (unbounded stream), while seek reads
+/// should pass `end=Some(offset+size)` (bounded range). Validates that the mock
+/// correctly records and respects the `end` parameter.
 #[test]
-fn warm_cache_triggered_on_open_sequential_read() {
-    const WARM_DELAY_MS: u64 = 50;
-    const FILE_SIZE: u64 = 1024 * 1024; // 1 MiB — small so data fetch is trivial
+fn stream_calls_record_bounded_end_for_seek_reads() {
+    // File must be larger than INITIAL_WINDOW (8 MiB) + FORWARD_SKIP (16 MiB) so a
+    // far seek triggers RangeDownload instead of a forward skip restart.
+    const FILE_SIZE: u64 = 30 * 1_048_576; // 30 MiB
 
     let hub = MockHub::new();
-    hub.add_file("file.bin", FILE_SIZE, Some("hash_abc"), None);
+    hub.add_file("file.bin", FILE_SIZE, Some("hash_xyz"), None);
     let xet = MockXet::new();
+    // Use a small repeated pattern — only allocate enough to verify content.
     let data: Vec<u8> = (0..FILE_SIZE as usize).map(|i| (i % 251) as u8).collect();
-    xet.add_file("hash_abc", &data);
-    xet.set_warm_delay_ms(WARM_DELAY_MS);
+    xet.add_file("hash_xyz", &data);
 
     let (rt, vfs) = vfs_readonly(&hub, &xet);
 
     rt.block_on(async {
         let attr = vfs.lookup(ROOT_INODE, "file.bin").await.unwrap();
-
-        // ── open #1 ──────────────────────────────────────────────────
-        // Warm task starts in background with 50 ms delay.
-        // We yield briefly so the task is definitely running before read().
-        let fh1 = vfs.open(attr.ino, false, false, None).await.unwrap();
+        let fh = vfs.open(attr.ino, false, false, None).await.unwrap();
         tokio::task::yield_now().await;
 
-        // First read must wait for warm to complete — expect ≥ WARM_DELAY_MS.
-        let t0 = std::time::Instant::now();
-        let (chunk, _) = vfs.read(fh1, 0, 4096).await.unwrap();
-        let elapsed_first = t0.elapsed();
-
+        // Sequential read at offset 0 — should use unbounded stream (end=None).
+        let (chunk, _) = vfs.read(fh, 0, 4096).await.unwrap();
         assert_eq!(chunk.len(), 4096);
-        assert_eq!(chunk[0], 0u8); // pattern byte at offset 0
-        assert!(
-            elapsed_first.as_millis() >= WARM_DELAY_MS as u128,
-            "first read finished in {}ms — should have waited for warm ({} ms)",
-            elapsed_first.as_millis(),
-            WARM_DELAY_MS,
-        );
 
-        // Warm was called exactly once so far.
-        assert_eq!(xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        // Subsequent reads on the same handle are immediate (watch already true).
-        let t1 = std::time::Instant::now();
-        let (chunk2, _) = vfs.read(fh1, 4096, 4096).await.unwrap();
-        let elapsed_second = t1.elapsed();
+        // Far seek read (past INITIAL_WINDOW + FORWARD_SKIP) — should use bounded range.
+        let far_offset = 25 * 1_048_576u64; // 25 MiB
+        let (chunk2, _) = vfs.read(fh, far_offset, 4096).await.unwrap();
         assert_eq!(chunk2.len(), 4096);
-        assert_eq!(chunk2[0], (4096 % 251) as u8);
+        assert_eq!(chunk2[0], (far_offset as usize % 251) as u8);
+
+        let calls = xet.stream_calls.lock().unwrap().clone();
+        // First call: sequential (end=None).
+        assert_eq!(calls[0].0, 0, "first call should start at offset 0");
+        assert_eq!(calls[0].1, None, "sequential read should have end=None");
+        // Second call: seek (end=Some).
+        assert_eq!(calls[1].0, far_offset, "seek call should start at far_offset");
         assert!(
-            elapsed_second.as_millis() < 10,
-            "second read took {}ms — should be near-instant (no warm wait)",
-            elapsed_second.as_millis(),
+            calls[1].1.is_some(),
+            "seek read should have end=Some (bounded range), got {:?}",
+            calls[1].1
         );
 
-        vfs.release(fh1).await.unwrap();
-
-        // ── open #2 ──────────────────────────────────────────────────
-        // Each open() is an independent handle with its own warm task.
-        let fh2 = vfs.open(attr.ino, false, false, None).await.unwrap();
-        tokio::task::yield_now().await;
-
-        vfs.read(fh2, 0, 4096).await.unwrap();
-
-        assert_eq!(
-            xet.warm_call_count.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "second open should trigger a second warm call"
-        );
-
-        vfs.release(fh2).await.unwrap();
+        vfs.release(fh).await.unwrap();
     });
 }

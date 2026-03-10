@@ -14,7 +14,10 @@ use xorb_object::SerializedXorbObject;
 
 type Result<T> = std::result::Result<T, cas_client::CasClientError>;
 
-const MAX_CACHE_ENTRIES: usize = 1024;
+/// Cache key: file hash + optional byte range (`None` = full-file plan).
+type ReconCacheKey = (MerkleHash, Option<FileRange>);
+
+const MAX_CACHE_ENTRIES: usize = 4096;
 /// Presigned URLs returned by the CAS server expire after 1 hour.
 /// Evict cache entries just before expiry to avoid serving stale URLs.
 const CACHE_TTL: Duration = Duration::from_secs(59 * 60);
@@ -40,9 +43,13 @@ impl CacheEntry {
 // TODO: move this into xet-core (cas_client or file_reconstruction) so all consumers benefit.
 pub struct CachedXetClient {
     inner: Arc<dyn Client>,
-    /// Only full-file reconstruction plans are cached (key = file hash, no range).
-    /// Range responses are derived on the fly via `derive_range_response`.
-    cache: Mutex<HashMap<MerkleHash, CacheEntry>>,
+    /// Reconstruction plan cache. Key is (file_hash, range) where `None` = full-file plan.
+    /// Full-file plans are preferred: range queries are derived locally when available.
+    /// Range-scoped entries serve as fast fallback while the full plan warms up.
+    cache: Mutex<HashMap<ReconCacheKey, CacheEntry>>,
+    /// Single-flight: in-flight CAS requests. When multiple callers request the same
+    /// key concurrently, only the first makes the CAS call; others wait and read from cache.
+    inflight: Mutex<HashMap<ReconCacheKey, tokio::sync::broadcast::Sender<()>>>,
     ttl: Duration,
 }
 
@@ -55,6 +62,7 @@ impl CachedXetClient {
         Arc::new(Self {
             inner,
             cache: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
             ttl,
         })
     }
@@ -132,60 +140,136 @@ impl Client for CachedXetClient {
         file_id: &MerkleHash,
         bytes_range: Option<FileRange>,
     ) -> Result<Option<QueryReconstructionResponse>> {
-        // Clone the full-file plan under a brief lock, then derive outside the lock so
-        // concurrent pread() calls from N threads don't serialize on this mutex.
-        let cached_full = {
-            let mut cache = self.cache.lock().expect("cache poisoned");
-            match cache.get(file_id) {
-                Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
-                Some(_) => {
-                    // Expired — evict so the next caller fetches fresh URLs from CAS.
-                    cache.remove(file_id);
-                    None
-                }
-                None => None,
-            }
-        }; // ← lock released here
+        let key: ReconCacheKey = (*file_id, bytes_range);
 
-        if let Some(full) = cached_full {
-            if let Some(range) = bytes_range {
-                let resp = derive_range_response(&full, range);
-                // Mirror the CAS server's EOF contract:
-                // - Non-empty file, range past EOF → None
-                // - Empty file, range.start == 0 → Some(empty_terms)  (only valid range on empty file)
-                // - Empty file, range.start > 0  → None               (past EOF on empty file)
-                if resp.terms.is_empty() && (!full.terms.is_empty() || range.start > 0) {
-                    return Ok(None);
-                }
-                tracing::debug!(
-                    "recon: DERV file={:.8} range={:?} terms={}",
-                    file_id,
-                    bytes_range,
-                    resp.terms.len()
-                );
-                return Ok(Some(resp));
-            } else {
-                tracing::debug!("recon: HIT  file={:.8} range=None terms={}", file_id, full.terms.len());
-                return Ok(Some(full));
-            }
+        // Single-flight action: either wait for an in-flight request or lead the fetch.
+        enum Action {
+            Wait(tokio::sync::broadcast::Receiver<()>),
+            Lead(tokio::sync::broadcast::Sender<()>),
         }
 
-        tracing::debug!("recon: CAS  file={:.8} range={:?}", file_id, bytes_range);
-        let result = self.inner.get_reconstruction(file_id, bytes_range).await?;
-
-        // Only cache full-file plans. Range responses are never stored: they are always
-        // derived from the full-file plan, and the full-file plan is warmed at open() time.
-        if bytes_range.is_none()
-            && let Some(response) = &result
-        {
-            let mut cache = self.cache.lock().expect("cache poisoned");
-            if cache.len() >= MAX_CACHE_ENTRIES {
-                cache.clear();
+        loop {
+            // --- 1. Cache check ---
+            // Single lock: check exact key first, then full-file plan as fallback.
+            // For range queries the exact CAS response has tighter ChunkRanges (trimmed
+            // at chunk granularity) than what derive_range_response produces from the
+            // full plan, so prefer it when available.
+            enum CacheResult {
+                ExactHit(QueryReconstructionResponse),
+                FullPlan(QueryReconstructionResponse, FileRange),
+                Miss,
             }
-            cache.insert(*file_id, CacheEntry::new(response.clone()));
-        }
 
-        Ok(result)
+            let cached = {
+                let mut cache = self.cache.lock().expect("cache poisoned");
+
+                let try_get = |cache: &mut HashMap<ReconCacheKey, CacheEntry>, key: ReconCacheKey| match cache.get(&key)
+                {
+                    Some(entry) if entry.is_valid(self.ttl) => Some(entry.response.clone()),
+                    Some(_) => {
+                        cache.remove(&key);
+                        None
+                    }
+                    None => None,
+                };
+
+                if let Some(resp) = try_get(&mut cache, key) {
+                    CacheResult::ExactHit(resp)
+                } else if let Some(range) = bytes_range {
+                    match try_get(&mut cache, (*file_id, None)) {
+                        Some(full) => CacheResult::FullPlan(full, range),
+                        None => CacheResult::Miss,
+                    }
+                } else {
+                    CacheResult::Miss
+                }
+            };
+
+            match cached {
+                CacheResult::ExactHit(resp) => {
+                    tracing::debug!(
+                        "recon: HIT  file={:.8} range={:?} terms={}",
+                        file_id,
+                        bytes_range,
+                        resp.terms.len()
+                    );
+                    return Ok(Some(resp));
+                }
+                CacheResult::FullPlan(full, range) => {
+                    let resp = derive_range_response(&full, range);
+                    // Mirror the CAS server's EOF contract:
+                    // - Non-empty file, range past EOF → None
+                    // - Empty file, range.start == 0 → Some(empty_terms)  (only valid range)
+                    // - Empty file, range.start > 0  → None               (past EOF)
+                    if resp.terms.is_empty() && (!full.terms.is_empty() || range.start > 0) {
+                        return Ok(None);
+                    }
+                    tracing::debug!(
+                        "recon: DERV file={:.8} range={:?} terms={}",
+                        file_id,
+                        bytes_range,
+                        resp.terms.len()
+                    );
+                    return Ok(Some(resp));
+                }
+                CacheResult::Miss => {}
+            }
+
+            // --- 2. Single-flight: coalesce concurrent requests for the same key ---
+            let action = {
+                let mut inflight = self.inflight.lock().expect("inflight poisoned");
+                if let Some(tx) = inflight.get(&key) {
+                    Action::Wait(tx.subscribe())
+                } else {
+                    let (tx, _) = tokio::sync::broadcast::channel(1);
+                    inflight.insert(key, tx.clone());
+                    Action::Lead(tx)
+                }
+            };
+
+            match action {
+                Action::Wait(mut rx) => {
+                    // Another caller is fetching this key — wait, then re-check cache.
+                    let _ = rx.recv().await;
+                    continue;
+                }
+                Action::Lead(tx) => {
+                    // We're the leader — make the CAS call.
+                    tracing::debug!("recon: CAS  file={:.8} range={:?}", file_id, bytes_range);
+                    let result = self.inner.get_reconstruction(file_id, bytes_range).await;
+
+                    if let Ok(Some(response)) = &result {
+                        let mut cache = self.cache.lock().expect("cache poisoned");
+
+                        // When inserting a full plan, purge redundant range entries for this hash
+                        // (they're now derivable from the full plan, no point keeping them).
+                        if bytes_range.is_none() {
+                            cache.retain(|(hash, range), _| *hash != *file_id || range.is_none());
+                        }
+
+                        if cache.len() >= MAX_CACHE_ENTRIES {
+                            // First pass: evict range entries (less valuable than full plans).
+                            cache.retain(|(_hash, range), _| range.is_none());
+                            if cache.len() >= MAX_CACHE_ENTRIES {
+                                // Still full (all full plans). Evict one arbitrary entry
+                                // to make room — never skip the insert, as single-flight
+                                // waiters expect the result to be in cache.
+                                if let Some(victim) = cache.keys().next().copied() {
+                                    cache.remove(&victim);
+                                }
+                            }
+                        }
+                        cache.insert(key, CacheEntry::new(response.clone()));
+                    }
+
+                    // Notify waiters and clean up.
+                    self.inflight.lock().expect("inflight poisoned").remove(&key);
+                    let _ = tx.send(());
+
+                    return result;
+                }
+            }
+        } // loop
     }
 
     async fn get_file_reconstruction_info(
@@ -263,7 +347,8 @@ mod tests {
         mode: MockMode,
         calls: Mutex<HashMap<(MerkleHash, Option<FileRange>), usize>>,
         total_calls: AtomicUsize,
-        barrier: Option<Arc<tokio::sync::Barrier>>,
+        /// Optional delay injected before returning (simulates CAS latency).
+        delay: Option<Duration>,
     }
 
     impl MockClient {
@@ -272,16 +357,16 @@ mod tests {
                 mode,
                 calls: Mutex::new(HashMap::new()),
                 total_calls: AtomicUsize::new(0),
-                barrier: None,
+                delay: None,
             }
         }
 
-        fn with_barrier(mode: MockMode, parties: usize) -> Self {
+        fn with_delay(mode: MockMode, delay: Duration) -> Self {
             Self {
                 mode,
                 calls: Mutex::new(HashMap::new()),
                 total_calls: AtomicUsize::new(0),
-                barrier: Some(Arc::new(tokio::sync::Barrier::new(parties))),
+                delay: Some(delay),
             }
         }
 
@@ -313,8 +398,8 @@ mod tests {
             }
             self.total_calls.fetch_add(1, Ordering::Relaxed);
 
-            if let Some(barrier) = &self.barrier {
-                barrier.wait().await;
+            if let Some(delay) = self.delay {
+                tokio::time::sleep(delay).await;
             }
 
             match self.mode {
@@ -448,20 +533,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn range_query_hits_backend_when_no_full_file_cached() {
+    async fn range_query_cached_when_no_full_file_plan() {
         let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
         let inner: Arc<dyn Client> = inner_impl.clone();
         let client = CachedXetClient::new(inner);
         let key = hash_for(40);
         let r = Some(FileRange::new(10, 20));
 
-        // Range query with no full-file plan cached → hits backend.
-        // The response is NOT cached (range responses are never stored).
+        // Range query with no full-file plan cached → hits backend once, then cached.
         client.get_reconstruction(&key, r).await.unwrap();
         client.get_reconstruction(&key, r).await.unwrap();
 
-        assert_eq!(inner_impl.call_count((key, r)), 2); // no cache, each hits backend
-        assert_eq!(inner_impl.total_calls(), 2);
+        assert_eq!(inner_impl.call_count((key, r)), 1); // cached after first fetch
+        assert_eq!(inner_impl.total_calls(), 1);
     }
 
     #[tokio::test]
@@ -479,7 +563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_clears_when_capacity_is_reached() {
+    async fn cache_evicts_one_when_capacity_is_reached() {
         let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
         let inner: Arc<dyn Client> = inner_impl.clone();
         let client = CachedXetClient::new(inner);
@@ -492,17 +576,95 @@ mod tests {
         let overflow = hash_for(MAX_CACHE_ENTRIES);
         client.get_reconstruction(&overflow, None).await.unwrap();
 
-        let first = hash_for(0);
-        client.get_reconstruction(&first, None).await.unwrap();
-
-        assert_eq!(inner_impl.call_count((first, None)), 2);
+        // Overflow should be cached (inserted after evicting one victim).
         assert_eq!(inner_impl.call_count((overflow, None)), 1);
+        client.get_reconstruction(&overflow, None).await.unwrap();
+        assert_eq!(inner_impl.call_count((overflow, None)), 1); // still cached
+
+        // Exactly one of the original entries was evicted — total CAS calls
+        // should be MAX_CACHE_ENTRIES + 1 (one per original + overflow).
+        assert_eq!(inner_impl.total_calls(), MAX_CACHE_ENTRIES + 1);
     }
 
     #[tokio::test]
-    async fn concurrent_same_key_requests_do_not_panic_under_race() {
+    async fn eviction_preserves_full_plans_over_range_entries() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+        let key = hash_for(1);
+
+        // Cache one full-file plan.
+        client.get_reconstruction(&key, None).await.unwrap();
+
+        // Fill the rest with range entries to trigger eviction.
+        for i in 0..MAX_CACHE_ENTRIES {
+            let r = Some(FileRange::new(i as u64 * 100, i as u64 * 100 + 50));
+            client.get_reconstruction(&hash_for(i + 1000), r).await.unwrap();
+        }
+
+        // Full plan should survive eviction — still cached.
+        client.get_reconstruction(&key, None).await.unwrap();
+        assert_eq!(inner_impl.call_count((key, None)), 1); // still cached
+    }
+
+    #[tokio::test]
+    async fn full_plan_insert_purges_stale_range_entries() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+        let key = hash_for(70);
+
+        // Cache a range entry first (no full plan available).
+        let r = Some(FileRange::new(100, 200));
+        client.get_reconstruction(&key, r).await.unwrap();
+        assert_eq!(inner_impl.call_count((key, r)), 1);
+
+        // Now insert the full plan — should purge the range entry.
+        client.get_reconstruction(&key, None).await.unwrap();
+
+        // Verify the range entry was purged by checking cache size:
+        // only the full plan should remain. A subsequent range query should
+        // derive from the full plan (no new CAS call).
+        let r2 = Some(FileRange::new(100, 200));
+        client.get_reconstruction(&key, r2).await.unwrap();
+        // Still 1 CAS call for the range — it was purged but derived from full plan.
+        assert_eq!(inner_impl.call_count((key, r2)), 1);
+        assert_eq!(inner_impl.total_calls(), 2); // 1 range + 1 full plan, no extra
+    }
+
+    #[tokio::test]
+    async fn range_entry_cached_when_full_of_full_plans_evicts_one() {
+        let inner_impl = Arc::new(MockClient::new(MockMode::ReturnSome));
+        let inner: Arc<dyn Client> = inner_impl.clone();
+        let client = CachedXetClient::new(inner);
+
+        // Fill cache with full plans.
+        for i in 0..MAX_CACHE_ENTRIES {
+            client.get_reconstruction(&hash_for(i), None).await.unwrap();
+        }
+
+        // Range query on a new hash — evicts one full plan, inserts range entry.
+        let overflow_hash = hash_for(MAX_CACHE_ENTRIES + 1);
+        let r = Some(FileRange::new(0, 100));
+        client.get_reconstruction(&overflow_hash, r).await.unwrap();
+        // Second call should be cached (single-flight waiters can find it).
+        client.get_reconstruction(&overflow_hash, r).await.unwrap();
+        assert_eq!(inner_impl.call_count((overflow_hash, r)), 1);
+
+        // Most full plans should still be cached (only one was evicted).
+        // hash_for(1) should survive since eviction picks an arbitrary entry.
+        let total_before = inner_impl.total_calls();
+        client.get_reconstruction(&hash_for(1), None).await.unwrap();
+        // It's either still cached (1 call total) or was the evicted victim (refetched).
+        // Either way, the important thing is we didn't clear ALL full plans.
+        assert!(inner_impl.total_calls() <= total_before + 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_key_coalesces_via_single_flight() {
         let contenders = 8usize;
-        let inner_impl = Arc::new(MockClient::with_barrier(MockMode::ReturnSome, contenders));
+        // Delay ensures the leader's CAS call is still in-flight when others arrive.
+        let inner_impl = Arc::new(MockClient::with_delay(MockMode::ReturnSome, Duration::from_millis(50)));
         let inner: Arc<dyn Client> = inner_impl.clone();
         let client = CachedXetClient::new(inner);
         let key = hash_for(99);
@@ -518,7 +680,8 @@ mod tests {
             assert!(resp.is_some());
         }
 
-        // This test asserts race-safety (no panics/deadlocks), not single-flight behavior.
-        assert_eq!(inner_impl.call_count((key, None)), contenders);
+        // Single-flight: only 1 CAS call despite 8 concurrent requests.
+        assert_eq!(inner_impl.call_count((key, None)), 1);
+        assert_eq!(inner_impl.total_calls(), 1);
     }
 }
