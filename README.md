@@ -11,7 +11,7 @@ hf-mount start bucket myuser/my-bucket /tmp/data
 Also works with any model or dataset repo (read-only):
 
 ```bash
-hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss-20b
+hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss
 ```
 
 Commands will pick up your HF_TOKEN from env if present, or you can pass it explicitly:
@@ -23,7 +23,7 @@ hf-mount --hf-token $HF_TOKEN
 Then use your local folders as usual:
 ```python
 from transformers import AutoModelForCausalLM
-model = AutoModelForCausalLM.from_pretrained("/tmp/gpt-oss-20b")  # reads on demand, no download step
+model = AutoModelForCausalLM.from_pretrained("/tmp/gpt-oss")  # reads on demand, no download step
 ```
 
 hf-mount exposes [Hugging Face Buckets](https://huggingface.co/docs/hub/storage-buckets) and [Hub repos](https://huggingface.co) as a local filesystem via FUSE or NFS. Files are fetched lazily on first read, so only the bytes your code actually touches ever hit the network.
@@ -80,14 +80,14 @@ Binaries: `target/release/hf-mount`, `target/release/hf-mount-nfs`, `target/rele
 
 ```bash
 # Mount a public model as a background daemon (no token needed)
-hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss-20b
-ls /tmp/gpt-oss-20b
+hf-mount start repo openai/gpt-oss-20b /tmp/gpt-oss
+ls /tmp/gpt-oss
 
 # Use it from Python
 python -c "
 from transformers import AutoTokenizer, AutoModelForCausalLM
-tok = AutoTokenizer.from_pretrained('/tmp/gpt-oss-20b')
-model = AutoModelForCausalLM.from_pretrained('/tmp/gpt-oss-20b')
+tok = AutoTokenizer.from_pretrained('/tmp/gpt-oss')
+model = AutoModelForCausalLM.from_pretrained('/tmp/gpt-oss')
 print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0]))
 "
 
@@ -99,7 +99,7 @@ du -sh /tmp/hn/*.parquet
 hf-mount status
 
 # Stop
-hf-mount stop /tmp/gpt-oss-20b
+hf-mount stop /tmp/gpt-oss
 hf-mount stop /tmp/hn
 ```
 
@@ -129,7 +129,7 @@ All examples use `hf-mount-nfs`. Replace with `hf-mount-fuse` if you prefer the 
 
 ```bash
 # Public model (no token needed)
-hf-mount-nfs repo openai/gpt-oss-20b /tmp/gpt-oss-20b
+hf-mount-nfs repo openai/gpt-oss-20b /tmp/gpt-oss
 
 # Private model
 hf-mount-nfs --hf-token $HF_TOKEN repo myorg/my-private-model /tmp/model
@@ -205,7 +205,7 @@ cat > ~/Library/LaunchAgents/$label.plist <<EOF
         <string>$HOME/.local/bin/hf-mount-nfs</string>
         <string>repo</string>
         <string>openai/gpt-oss-20b</string>
-        <string>/tmp/gpt-oss-20b</string>
+        <string>/tmp/gpt-oss</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
