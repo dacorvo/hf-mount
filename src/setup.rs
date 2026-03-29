@@ -150,6 +150,13 @@ pub struct MountOptions {
     /// When not set, requires `user_allow_other` in /etc/fuse.conf on Linux.
     #[arg(long, default_value_t = false)]
     pub fuse_owner_only: bool,
+
+    /// Local upper directory for overlay mode (overlayfs semantics).
+    /// When set with --read-only, the mount presents a merged view:
+    /// reads check the upperdir first then the remote (lowerdir),
+    /// writes and copy-on-write go to the upperdir only.
+    #[arg(long)]
+    pub upperdir: Option<PathBuf>,
 }
 
 /// CLI args for the foreground FUSE/NFS binaries.
@@ -283,6 +290,17 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         info!("Repo mounts are always read-only");
     }
 
+    // Validate upperdir option
+    let upperdir = options.upperdir.clone();
+    if let Some(ref ud) = upperdir {
+        if !read_only {
+            panic!("--upperdir is only valid with --read-only (overlay mode)");
+        }
+        std::fs::create_dir_all(ud)
+            .unwrap_or_else(|e| panic!("Failed to create upperdir {:?}: {e}", ud));
+        info!("Overlay mode: upperdir={:?}", ud);
+    }
+
     let refresher = hub_client.token_refresher(read_only);
     let cas_config = build_cas_config(&runtime, &refresher);
 
@@ -356,7 +374,8 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
     info!(
         "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
          cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
-         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
+         flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={} \
+         upperdir={:?}",
         advanced_writes,
         options.direct_io,
         options.poll_interval_secs,
@@ -370,6 +389,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
         uid,
         gid,
         !options.no_filter_os_files,
+        upperdir,
     );
 
     let metadata_ttl = std::time::Duration::from_millis(options.metadata_ttl_ms);
@@ -391,6 +411,7 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
             direct_io: options.direct_io && !is_nfs,
             flush_debounce: std::time::Duration::from_millis(options.flush_debounce_ms),
             flush_max_batch_window: std::time::Duration::from_millis(options.flush_max_batch_window_ms),
+            upperdir,
         },
     );
 

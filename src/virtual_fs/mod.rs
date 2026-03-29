@@ -57,6 +57,9 @@ pub struct VfsConfig {
     pub direct_io: bool,
     pub flush_debounce: Duration,
     pub flush_max_batch_window: Duration,
+    /// Local directory for overlay writes (used with read-only mounts).
+    /// When set, reads check this directory first, writes go here only.
+    pub upperdir: Option<PathBuf>,
 }
 
 /// Lock ordering (acquire in this order to prevent deadlocks):
@@ -123,6 +126,9 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// Local overlay upperdirectory. Reads check here first, writes go here only.
+    /// Only active when `read_only` is true (overlay mode).
+    upperdir: Option<PathBuf>,
 }
 
 /// Where to read file content from when opening read-only.
@@ -202,6 +208,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            upperdir: config.upperdir,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -245,10 +252,38 @@ impl VirtualFs {
         info!("Flush loop finished, VFS shut down.");
     }
 
+    // ── Overlay upperdir helpers ──────────────────────────────────────
+
+    /// Returns true when overlay mode is active (read-only mount + upperdir).
+    fn has_upperdir(&self) -> bool {
+        self.upperdir.is_some()
+    }
+
+    /// Map a VFS `full_path` to a local path inside the upperdir.
+    /// Returns `None` when overlay mode is not active.
+    fn upperdir_path(&self, full_path: &str) -> Option<PathBuf> {
+        self.upperdir.as_ref().map(|wd| wd.join(full_path))
+    }
+
+    /// List children in an upperdir directory (names only).
+    /// Returns empty vec if the directory doesn't exist or overlay is inactive.
+    fn list_upperdir_children(&self, dir_path: &str) -> Vec<String> {
+        let Some(wd_path) = self.upperdir_path(dir_path) else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(&wd_path) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect()
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────
 
     fn make_vfs_attr(&self, entry: &InodeEntry) -> VirtualFsAttr {
-        let perm = if self.read_only {
+        let perm = if self.read_only && !self.has_upperdir() {
             match entry.kind {
                 InodeKind::File => 0o444,
                 InodeKind::Directory => 0o555,
@@ -511,6 +546,44 @@ impl VirtualFs {
                 if !has_dirty_or_open {
                     inodes.remove(ino);
                 }
+            }
+        }
+
+        // Overlay mode: merge children from upperdir that don't exist in remote
+        if self.has_upperdir() {
+            let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
+            let wd_children = self.list_upperdir_children(&dir_path);
+            for child_name in wd_children {
+                // Skip if already in inode table from remote listing
+                if inodes.lookup_child(parent_ino, &child_name).is_some() {
+                    continue;
+                }
+                let child_full_path = if dir_path.is_empty() {
+                    child_name.clone()
+                } else {
+                    format!("{}/{}", dir_path, child_name)
+                };
+                let wd_child_path = self.upperdir_path(&child_full_path).unwrap();
+                let (kind, size) = if wd_child_path.is_dir() {
+                    (InodeKind::Directory, 0)
+                } else {
+                    let size = wd_child_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    (InodeKind::File, size)
+                };
+                let now = SystemTime::now();
+                let default_mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
+                inodes.insert(
+                    parent_ino,
+                    child_name,
+                    child_full_path,
+                    kind,
+                    size,
+                    now,
+                    None,
+                    default_mode,
+                    self.uid,
+                    self.gid,
+                );
             }
         }
 
@@ -926,14 +999,40 @@ impl VirtualFs {
             ino, writable, truncate, pid
         );
 
-        if writable && self.read_only {
+        if writable && self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
 
         let file_entry = self.get_file_entry(ino)?;
         let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
 
-        if writable && self.advanced_writes {
+        if writable && self.has_upperdir() {
+            // Overlay mode: open (or create) file in upperdir for writing
+            let wd_path = self.upperdir_path(&file_entry.full_path).unwrap();
+            if let Some(parent_dir) = wd_path.parent() {
+                let _ = std::fs::create_dir_all(parent_dir);
+            }
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(truncate)
+                .open(&wd_path)
+                .map_err(|e| {
+                    error!("Failed to open upperdir file {:?}: {}", wd_path, e);
+                    libc::EIO
+                })?;
+            let file_handle = self.alloc_file_handle();
+            self.open_files.write().expect("open_files poisoned").insert(
+                file_handle,
+                OpenFile::Local {
+                    ino,
+                    file: Arc::new(file),
+                    writable: true,
+                },
+            );
+            Ok(file_handle)
+        } else if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
             self.open_advanced_write(ino, &file_entry.xet_hash, file_entry.size, staging_path, truncate)
                 .await
@@ -1071,6 +1170,13 @@ impl VirtualFs {
 
     /// Open a file for reading. Dispatches based on where the content lives.
     async fn open_readonly(&self, ino: u64, fe: FileEntry, staging_path: Option<PathBuf>) -> VirtualFsResult<u64> {
+        // Overlay mode: check upperdir first (local override takes precedence)
+        if let Some(wd_path) = self.upperdir_path(&fe.full_path) {
+            if wd_path.exists() {
+                return self.open_local_readonly(ino, &wd_path);
+            }
+        }
+
         match (fe.is_dirty, &staging_path) {
             // Advanced write in progress — read from local staging file.
             (true, Some(path)) if path.exists() => self.open_local_readonly(ino, path),
@@ -1395,7 +1501,7 @@ impl VirtualFs {
             data.len()
         );
 
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
 
@@ -1493,6 +1599,12 @@ impl VirtualFs {
 
     pub async fn flush(&self, ino: u64, file_handle: u64, pid: Option<u32>) -> VirtualFsResult<()> {
         debug!("flush: ino={}, fh={}, pid={:?}", ino, file_handle, pid);
+
+        // Overlay mode: files live in upperdir, no remote upload needed.
+        // The OS will flush the local file handle automatically.
+        if self.has_upperdir() {
+            return Ok(());
+        }
 
         // Check if this is a streaming handle → synchronous upload + commit
         let streaming_channel = {
@@ -1807,7 +1919,7 @@ impl VirtualFs {
         caller_gid: u32,
         pid: Option<u32>,
     ) -> VirtualFsResult<(VirtualFsAttr, u64)> {
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
         if self.filter_os_files && is_os_junk(name) {
@@ -1861,7 +1973,44 @@ impl VirtualFs {
             fm.cancel_delete(&full_path);
         }
 
-        if self.advanced_writes {
+        if self.has_upperdir() {
+            // Overlay mode: create file directly in upperdir (no remote upload)
+            let wd_path = self.upperdir_path(&full_path).unwrap();
+            if let Some(parent_dir) = wd_path.parent() {
+                if let Err(e) = std::fs::create_dir_all(parent_dir) {
+                    error!("Failed to create upperdir parent {:?}: {}", parent_dir, e);
+                    self.inode_table.write().expect("inodes poisoned").remove(ino);
+                    return Err(libc::EIO);
+                }
+            }
+            match OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&wd_path)
+            {
+                Ok(file) => {
+                    let file_handle = self.alloc_file_handle();
+                    self.open_files.write().expect("open_files poisoned").insert(
+                        file_handle,
+                        OpenFile::Local {
+                            ino,
+                            file: Arc::new(file),
+                            writable: true,
+                        },
+                    );
+                    let inodes = self.inode_table.read().expect("inodes poisoned");
+                    let attr = self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?);
+                    Ok((attr, file_handle))
+                }
+                Err(e) => {
+                    error!("Failed to create file in upperdir: {}", e);
+                    self.inode_table.write().expect("inodes poisoned").remove(ino);
+                    Err(libc::EIO)
+                }
+            }
+        } else if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
             let staging_path = self
                 .staging_dir
@@ -1932,7 +2081,7 @@ impl VirtualFs {
         caller_uid: u32,
         caller_gid: u32,
     ) -> VirtualFsResult<VirtualFsAttr> {
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
         if self.filter_os_files && is_os_junk(name) {
@@ -1981,12 +2130,20 @@ impl VirtualFs {
 
         self.negative_cache_remove(&full_path);
 
+        // In overlay mode, create the directory on disk in upperdir
+        if let Some(wd_path) = self.upperdir_path(&full_path) {
+            if let Err(e) = std::fs::create_dir_all(&wd_path) {
+                error!("Failed to create directory in upperdir {:?}: {}", wd_path, e);
+                // Don't fail — the inode is already in the table for the merged view
+            }
+        }
+
         let inodes = self.inode_table.read().expect("inodes poisoned");
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
 
     pub async fn unlink(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
 
@@ -2015,9 +2172,13 @@ impl VirtualFs {
             return Err(libc::EPERM);
         }
 
-        // Advanced writes: queue delete for batched flush in the flush_loop.
-        // Simple mode: delete synchronously (one HTTP call per unlink).
-        if needs_remote_delete {
+        // Overlay mode: remove from upperdir only, skip remote
+        if self.has_upperdir() {
+            if let Some(wd_path) = self.upperdir_path(&full_path) {
+                let _ = std::fs::remove_file(&wd_path);
+            }
+        } else if needs_remote_delete {
+            // Not overlay — proceed with remote delete
             if let Some(fm) = &self.flush_manager {
                 fm.enqueue_delete(full_path.clone());
             } else if let Err(e) = self
@@ -2074,7 +2235,7 @@ impl VirtualFs {
         caller_uid: u32,
         caller_gid: u32,
     ) -> VirtualFsResult<VirtualFsAttr> {
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
 
@@ -2134,7 +2295,7 @@ impl VirtualFs {
     }
 
     pub async fn rmdir(&self, parent: u64, name: &str) -> VirtualFsResult<()> {
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
 
@@ -2187,7 +2348,7 @@ impl VirtualFs {
         newname: &str,
         no_replace: bool,
     ) -> VirtualFsResult<()> {
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
         if self.filter_os_files && is_os_junk(newname) {
@@ -2247,8 +2408,24 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops).
-        let remote_mutated = self.rename_remote(&info).await?;
+        // Phase 2: sync to remote (or upperdir for overlay mode).
+        let remote_mutated = if self.has_upperdir() {
+            // Overlay: rename within upperdir on the local filesystem
+            let old_path = self.upperdir_path(&info.old_path).unwrap();
+            let new_path = self.upperdir_path(&info.new_full_path).unwrap();
+            if old_path.exists() {
+                if let Some(p) = new_path.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                if let Err(e) = std::fs::rename(&old_path, &new_path) {
+                    error!("Overlay rename failed: {:?} → {:?}: {}", old_path, new_path, e);
+                    return Err(libc::EIO);
+                }
+            }
+            false
+        } else {
+            self.rename_remote(&info).await?
+        };
 
         // Phase 3: apply to local inode table under write lock.
         // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
@@ -2561,7 +2738,7 @@ impl VirtualFs {
         debug!("setattr: ino={}, size={:?}", ino, size);
 
         // EROFS check blocks all changes on RO mounts
-        if self.read_only {
+        if self.read_only && !self.has_upperdir() {
             return Err(libc::EROFS);
         }
 
