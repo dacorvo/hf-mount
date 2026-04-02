@@ -183,6 +183,10 @@ pub struct StagingDir {
     dir: PathBuf,
     /// Per-session random key to make staging paths unpredictable.
     session_key: u64,
+    /// When set, staging uses original file paths under the overlay root
+    /// instead of inode-based paths. This makes writes persist across
+    /// mount sessions and land in the actual local directory.
+    overlay_root: Option<PathBuf>,
 }
 
 impl StagingDir {
@@ -192,6 +196,19 @@ impl StagingDir {
         Self {
             dir,
             session_key: rand_u64(),
+            overlay_root: None,
+        }
+    }
+
+    /// Create a staging dir with overlay mode: staging paths use original
+    /// file paths under `overlay_root` instead of inode-based names.
+    pub fn new_overlay(cache_dir: &Path, overlay_root: PathBuf) -> Self {
+        let dir = cache_dir.join("staging");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("Failed to create staging dir {:?}: {e}", dir));
+        Self {
+            dir,
+            session_key: rand_u64(),
+            overlay_root: Some(overlay_root),
         }
     }
 
@@ -200,10 +217,31 @@ impl StagingDir {
         &self.dir
     }
 
-    /// Get the staging path for a given inode.
-    /// Deterministic within a session but unpredictable from outside.
+    /// The overlay root directory, if overlay mode is active.
+    pub fn overlay_root(&self) -> Option<&Path> {
+        self.overlay_root.as_deref()
+    }
+
+    /// Inode-based staging path (non-overlay mode only).
+    /// Used by FlushManager which doesn't have access to `full_path`.
     pub fn path(&self, inode: u64) -> PathBuf {
         self.dir.join(format!("ino_{:x}_{:016x}", inode, self.session_key))
+    }
+
+    /// Get the staging path for a file.
+    /// In overlay mode, uses the file's original path under the overlay root
+    /// (persists across mount sessions). Otherwise, uses an inode-based path.
+    pub fn staging_path(&self, inode: u64, full_path: &str) -> PathBuf {
+        if let Some(root) = &self.overlay_root {
+            root.join(full_path)
+        } else {
+            self.path(inode)
+        }
+    }
+
+    /// Whether this staging dir is in overlay mode.
+    pub fn is_overlay(&self) -> bool {
+        self.overlay_root.is_some()
     }
 }
 

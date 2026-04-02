@@ -484,6 +484,7 @@ pub fn make_test_vfs(
         crate::virtual_fs::VfsConfig {
             read_only: opts.read_only,
             advanced_writes: opts.advanced_writes,
+            overlay: false,
             uid: 1000,
             gid: 1000,
             poll_interval_secs: 0,

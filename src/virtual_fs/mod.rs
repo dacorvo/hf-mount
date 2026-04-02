@@ -48,6 +48,7 @@ fn is_os_junk(name: &str) -> bool {
 pub struct VfsConfig {
     pub read_only: bool,
     pub advanced_writes: bool,
+    pub overlay: bool,
     pub uid: u32,
     pub gid: u32,
     pub poll_interval_secs: u64,
@@ -137,7 +138,7 @@ impl VirtualFs {
         let inodes = Arc::new(RwLock::new(InodeTable::new()));
         let negative_cache = Arc::new(RwLock::new(HashMap::new()));
 
-        let flush_manager = if !config.read_only && config.advanced_writes {
+        let flush_manager = if !config.read_only && config.advanced_writes && !config.overlay {
             let sd = staging_dir
                 .as_ref()
                 .expect("--advanced-writes requires a staging directory");
@@ -514,6 +515,49 @@ impl VirtualFs {
             }
         }
 
+        // Overlay mode: merge local directory entries into the inode table.
+        // New local files are inserted; existing remote entries with the same
+        // name are overridden (local size/mtime, marked dirty so reads come
+        // from the local file). Uses the pre-mount fd to access the shadowed dir.
+        if let Some(sd) = &self.staging_dir
+            && let Some(overlay_root) = sd.overlay_root()
+        {
+            let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
+            let local_dir = overlay_root.join(&dir_path);
+            if let Ok(entries) = std::fs::read_dir(&local_dir) {
+                let now = SystemTime::now();
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let metadata = match entry.metadata() {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    let kind = if metadata.is_dir() {
+                        InodeKind::Directory
+                    } else {
+                        InodeKind::File
+                    };
+                    let full_path = inode::child_path(&dir_path, &name);
+                    let mtime = metadata.modified().unwrap_or(now);
+                    let size = metadata.len();
+                    let mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
+                    // insert() returns existing inode if path already exists (e.g. remote file)
+                    let ino = inodes.insert(
+                        parent_ino, name, full_path, kind, size, mtime, None, mode, self.uid, self.gid,
+                    );
+                    // Always update size/mtime from local file (local overrides remote)
+                    if let Some(e) = inodes.get_mut(ino) {
+                        e.size = size;
+                        e.mtime = mtime;
+                        e.set_dirty();
+                        if kind == InodeKind::Directory {
+                            e.children_loaded = false; // will be lazy-loaded on access
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(parent) = inodes.get_mut(parent_ino) {
             parent.children_loaded = true;
         }
@@ -860,6 +904,10 @@ impl VirtualFs {
             }
         }
         // Advanced-writes: flush staging file to Hub immediately.
+        // In overlay mode, writes stay local — skip remote upload.
+        if self.staging_dir.as_ref().is_some_and(|sd| sd.is_overlay()) {
+            return Ok(());
+        }
         // Note: if the flush_loop is concurrently processing this inode, both may
         // upload the same content. This is benign (idempotent commit, generation-aware
         // clear ensures only one clears dirty).
@@ -931,7 +979,10 @@ impl VirtualFs {
         }
 
         let file_entry = self.get_file_entry(ino)?;
-        let staging_path = self.staging_dir.as_ref().map(|sd| sd.path(ino));
+        let staging_path = self
+            .staging_dir
+            .as_ref()
+            .map(|sd| sd.staging_path(ino, &file_entry.full_path));
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
@@ -958,6 +1009,11 @@ impl VirtualFs {
         truncate: bool,
     ) -> VirtualFsResult<u64> {
         let staging_path = staging_path.expect("staging_dir required for advanced writes");
+
+        // Overlay paths may need parent directories created
+        if let Some(parent) = staging_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
 
         // Serialize staging preparation per inode (prevents concurrent download races)
         let staging_mutex = self.staging_lock(ino);
@@ -1867,7 +1923,11 @@ impl VirtualFs {
                 .staging_dir
                 .as_ref()
                 .expect("staging_dir required for advanced writes")
-                .path(ino);
+                .staging_path(ino, &full_path);
+            // Overlay paths may need parent directories created
+            if let Some(parent) = staging_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
             match OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -1981,6 +2041,13 @@ impl VirtualFs {
 
         self.negative_cache_remove(&full_path);
 
+        // Overlay mode: create the directory on disk so it persists
+        if let Some(sd) = &self.staging_dir
+            && let Some(overlay_path) = sd.overlay_root().map(|r| r.join(&full_path))
+        {
+            let _ = std::fs::create_dir_all(&overlay_path);
+        }
+
         let inodes = self.inode_table.read().expect("inodes poisoned");
         Ok(self.make_vfs_attr(inodes.get(ino).ok_or(libc::ENOENT)?))
     }
@@ -2053,7 +2120,7 @@ impl VirtualFs {
 
         // Clean up staging file only if inode was fully removed (no remaining hard links)
         if inode_removed && let Some(ref staging_dir) = self.staging_dir {
-            let staging_path = staging_dir.path(ino);
+            let staging_path = staging_dir.staging_path(ino, &full_path);
             if let Err(e) = std::fs::remove_file(&staging_path)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
