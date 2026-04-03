@@ -528,10 +528,15 @@ impl VirtualFs {
                 let now = SystemTime::now();
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    let metadata = match entry.metadata() {
+                    // Use symlink_metadata to avoid following symlinks
+                    let metadata = match std::fs::symlink_metadata(entry.path()) {
                         Ok(m) => m,
                         Err(_) => continue,
                     };
+                    // Skip symlinks — only regular files and directories
+                    if metadata.is_symlink() {
+                        continue;
+                    }
                     let kind = if metadata.is_dir() {
                         InodeKind::Directory
                     } else {
@@ -540,15 +545,20 @@ impl VirtualFs {
                     let full_path = inode::child_path(&dir_path, &name);
                     let mtime = metadata.modified().unwrap_or(now);
                     let size = metadata.len();
-                    let mode = if kind == InodeKind::Directory { 0o755 } else { 0o644 };
+                    let mode = {
+                        use std::os::unix::fs::PermissionsExt;
+                        (metadata.permissions().mode() & 0o777) as u16
+                    };
                     // insert() returns existing inode if path already exists (e.g. remote file)
                     let ino = inodes.insert(
                         parent_ino, name, full_path, kind, size, mtime, None, mode, self.uid, self.gid,
                     );
-                    // Always update size/mtime from local file (local overrides remote)
+                    // Always update from local file (local overrides remote).
+                    // Clear xet_hash so unlink/rename won't send stale remote ops.
                     if let Some(e) = inodes.get_mut(ino) {
                         e.size = size;
                         e.mtime = mtime;
+                        e.xet_hash = None;
                         e.set_dirty();
                         if kind == InodeKind::Directory {
                             e.children_loaded = false; // will be lazy-loaded on access
@@ -904,8 +914,15 @@ impl VirtualFs {
             }
         }
         // Advanced-writes: flush staging file to Hub immediately.
-        // In overlay mode, writes stay local — skip remote upload.
+        // In overlay mode, sync the local fd for durability but skip remote upload.
         if self.staging_dir.as_ref().is_some_and(|sd| sd.is_overlay()) {
+            let files = self.open_files.read().expect("open_files poisoned");
+            if let Some(OpenFile::Local { file, .. }) = files.get(&file_handle) {
+                file.sync_all().map_err(|e| {
+                    error!("Overlay fsync failed for ino={}: {}", ino, e);
+                    libc::EIO
+                })?;
+            }
             return Ok(());
         }
         // Note: if the flush_loop is concurrently processing this inode, both may

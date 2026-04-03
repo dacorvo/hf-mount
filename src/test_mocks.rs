@@ -516,9 +516,9 @@ pub fn make_test_vfs(
     )
 }
 
-/// Build a VFS with overlay mode for testing.
-/// If `overlay_root` is provided, it is used as the overlay directory
-/// (allowing tests to pre-populate files before VFS creation).
+/// Build a VFS with overlay mode for testing. The given `overlay_root`
+/// is used as the overlay directory, allowing tests to pre-populate
+/// files before VFS creation.
 /// Otherwise a fresh temp dir is created.
 pub fn make_overlay_test_vfs_with_root(
     hub: Arc<MockHub>,

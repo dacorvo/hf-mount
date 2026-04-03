@@ -335,13 +335,16 @@ pub fn build(source: Source, options: MountOptions, is_nfs: bool) -> MountSetup 
 
     // In overlay mode, open a fd to the mount point directory BEFORE mounting.
     // This preserves access to the underlying local files after the mount shadows them.
-    // We use /proc/self/fd/N to access it (tested to work for reads AND writes).
+    // We use /dev/fd/N to access it (works on both Linux and macOS).
     let overlay_fd = if options.overlay {
         use std::os::unix::io::AsRawFd;
+        // Ensure mount point exists before opening fd
+        std::fs::create_dir_all(&mount_point)
+            .unwrap_or_else(|e| panic!("Failed to create mount point {:?} for overlay: {e}", mount_point));
         let fd = std::fs::File::open(&mount_point)
             .unwrap_or_else(|e| panic!("Failed to open mount point {:?} for overlay: {e}", mount_point));
         let raw_fd = fd.as_raw_fd();
-        let overlay_root = PathBuf::from(format!("/proc/self/fd/{}", raw_fd));
+        let overlay_root = PathBuf::from(format!("/dev/fd/{}", raw_fd));
         info!("Overlay mode: local dir accessible via {:?}", overlay_root);
         Some((fd, overlay_root))
     } else {
