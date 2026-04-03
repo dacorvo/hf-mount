@@ -230,18 +230,18 @@ impl StagingDir {
 
     /// Get the staging path for a file.
     /// In overlay mode, uses the file's original path under the overlay root
-    /// (persists across mount sessions). Otherwise, uses an inode-based path.
-    pub fn staging_path(&self, inode: u64, full_path: &str) -> PathBuf {
+    /// (persists across mount sessions) and creates parent directories.
+    /// Otherwise, uses an inode-based path (flat, no parents needed).
+    pub fn staging_path(&self, inode: u64, full_path: &str) -> std::io::Result<PathBuf> {
         if let Some(root) = &self.overlay_root {
-            root.join(full_path)
+            let path = root.join(full_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            Ok(path)
         } else {
-            self.path(inode)
+            Ok(self.path(inode))
         }
-    }
-
-    /// Whether this staging dir is in overlay mode.
-    pub fn is_overlay(&self) -> bool {
-        self.overlay_root.is_some()
     }
 }
 

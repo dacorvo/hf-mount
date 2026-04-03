@@ -124,6 +124,8 @@ pub struct VirtualFs {
     filter_os_files: bool,
     /// When true, prefetch buffers drain after serving (forward-only, no re-read cache).
     direct_io: bool,
+    /// When true, writes stay local and no remote mutations (unlink, rename, flush) are sent.
+    overlay: bool,
 }
 
 /// Where to read file content from when opening read-only.
@@ -203,6 +205,7 @@ impl VirtualFs {
             serve_lookup_from_cache: config.serve_lookup_from_cache,
             filter_os_files: config.filter_os_files,
             direct_io: config.direct_io,
+            overlay: config.overlay,
         });
 
         // Set root inode mtime and ownership (repos use the last commit date).
@@ -519,8 +522,8 @@ impl VirtualFs {
         // New local files are inserted; existing remote entries with the same
         // name are overridden (local size/mtime, marked dirty so reads come
         // from the local file). Uses the pre-mount fd to access the shadowed dir.
-        if let Some(sd) = &self.staging_dir
-            && let Some(overlay_root) = sd.overlay_root()
+        if self.overlay
+            && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
         {
             let dir_path = inodes.get(parent_ino).map(|e| e.full_path.clone()).unwrap_or_default();
             let local_dir = overlay_root.join(&dir_path);
@@ -918,7 +921,7 @@ impl VirtualFs {
         }
         // Advanced-writes: flush staging file to Hub immediately.
         // In overlay mode, sync the local fd for durability but skip remote upload.
-        if self.staging_dir.as_ref().is_some_and(|sd| sd.is_overlay()) {
+        if self.overlay {
             let files = self.open_files.read().expect("open_files poisoned");
             if let Some(OpenFile::Local { file, .. }) = files.get(&file_handle) {
                 file.sync_all().map_err(|e| {
@@ -1002,7 +1005,12 @@ impl VirtualFs {
         let staging_path = self
             .staging_dir
             .as_ref()
-            .map(|sd| sd.staging_path(ino, &file_entry.full_path));
+            .map(|sd| sd.staging_path(ino, &file_entry.full_path))
+            .transpose()
+            .map_err(|e| {
+                error!("Failed to prepare staging path for ino={}: {}", ino, e);
+                libc::EIO
+            })?;
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
@@ -1029,14 +1037,6 @@ impl VirtualFs {
         truncate: bool,
     ) -> VirtualFsResult<u64> {
         let staging_path = staging_path.expect("staging_dir required for advanced writes");
-
-        // Overlay paths may need parent directories created
-        if let Some(parent) = staging_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                error!("Failed to create staging parent dir {:?}: {}", parent, e);
-                libc::EIO
-            })?;
-        }
 
         // Serialize staging preparation per inode (prevents concurrent download races)
         let staging_mutex = self.staging_lock(ino);
@@ -1784,6 +1784,9 @@ impl VirtualFs {
 
     /// Finalize a streaming write: send Finish to the worker, await CAS upload, commit to Hub.
     async fn streaming_commit(&self, ino: u64, channel: &StreamingChannel) -> Result<(), i32> {
+        // Overlay mode forces advanced_writes, so streaming writes are unreachable.
+        debug_assert!(!self.overlay, "streaming_commit must not be called in overlay mode");
+
         // Unlinked files (nlink=0) must not be re-committed on close —
         // user deleted the file, uploading would resurrect it.
         if self
@@ -1942,19 +1945,19 @@ impl VirtualFs {
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
-            let staging_path = self
+            let staging_path = match self
                 .staging_dir
                 .as_ref()
                 .expect("staging_dir required for advanced writes")
-                .staging_path(ino, &full_path);
-            // Overlay paths may need parent directories created
-            if let Some(parent) = staging_path.parent()
-                && let Err(e) = std::fs::create_dir_all(parent)
+                .staging_path(ino, &full_path)
             {
-                error!("Failed to create staging parent dir {:?}: {}", parent, e);
-                self.inode_table.write().expect("inodes poisoned").remove(ino);
-                return Err(libc::EIO);
-            }
+                Ok(p) => p,
+                Err(e) => {
+                    error!("Failed to prepare staging path for {}: {}", full_path, e);
+                    self.inode_table.write().expect("inodes poisoned").remove(ino);
+                    return Err(libc::EIO);
+                }
+            };
             match OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2069,10 +2072,17 @@ impl VirtualFs {
         self.negative_cache_remove(&full_path);
 
         // Overlay mode: create the directory on disk so it persists
-        if let Some(sd) = &self.staging_dir
-            && let Some(overlay_path) = sd.overlay_root().map(|r| r.join(&full_path))
+        if self.overlay
+            && let Some(overlay_path) = self
+                .staging_dir
+                .as_ref()
+                .and_then(|sd| sd.overlay_root())
+                .map(|r| r.join(&full_path))
+            && let Err(e) = std::fs::create_dir_all(&overlay_path)
         {
-            let _ = std::fs::create_dir_all(&overlay_path);
+            error!("Failed to create overlay directory {}: {}", overlay_path.display(), e);
+            self.inode_table.write().expect("inodes poisoned").remove(ino);
+            return Err(libc::EIO);
         }
 
         let inodes = self.inode_table.read().expect("inodes poisoned");
@@ -2095,8 +2105,15 @@ impl VirtualFs {
                 Some(_) => return Err(libc::EISDIR),
                 None => return Err(libc::ENOENT),
             };
-            // Remote delete only when last link is removed and file exists on the hub
-            let needs_remote = entry.xet_hash.is_some() && entry.nlink <= 1;
+            // Overlay mode: remote-only files cannot be deleted (no whiteout support).
+            // Local or COW'd files (dirty) can be deleted — the remote original
+            // reappears on remount, which is standard overlay semantics.
+            if self.overlay && !entry.is_dirty() && entry.xet_hash.is_some() {
+                return Err(libc::EPERM);
+            }
+            // Remote delete only when last link is removed and file exists on the hub.
+            // Overlay mode never mutates remote.
+            let needs_remote = !self.overlay && entry.xet_hash.is_some() && entry.nlink <= 1;
             (entry.inode, entry.full_path.clone(), needs_remote)
         };
 
@@ -2146,13 +2163,13 @@ impl VirtualFs {
         };
 
         // Clean up staging file only if inode was fully removed (no remaining hard links)
-        if inode_removed && let Some(ref staging_dir) = self.staging_dir {
-            let staging_path = staging_dir.staging_path(ino, &full_path);
-            if let Err(e) = std::fs::remove_file(&staging_path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!("Failed to remove staging file for ino={}: {}", ino, e);
-            }
+        if inode_removed
+            && let Some(ref staging_dir) = self.staging_dir
+            && let Ok(staging_path) = staging_dir.staging_path(ino, &full_path)
+            && let Err(e) = std::fs::remove_file(&staging_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!("Failed to remove staging file for ino={}: {}", ino, e);
         }
 
         info!("Deleted file: {}", full_path);
@@ -2304,6 +2321,20 @@ impl VirtualFs {
             self.ensure_children_loaded(newparent).await?;
         }
 
+        // Overlay mode: remote-only entries cannot be renamed (no whiteout for old path).
+        // Local or COW'd entries (dirty) can be renamed freely.
+        if self.overlay
+            && let Some(src) = self
+                .inode_table
+                .read()
+                .expect("inodes poisoned")
+                .lookup_child(parent, name)
+            && !src.is_dirty()
+            && src.xet_hash.is_some()
+        {
+            return Err(libc::EPERM);
+        }
+
         // Pre-load lazy directories before the sync validate phase:
         // - Source subtree: so descendant_files is complete for remote rename ops
         // - Destination dir (if exists): so children.is_empty() check is accurate
@@ -2341,8 +2372,32 @@ impl VirtualFs {
             }
         }
 
-        // Phase 2: sync to remote (add + delete ops).
-        let remote_mutated = self.rename_remote(&info).await?;
+        // Phase 2: sync to remote (add + delete ops). Overlay never mutates remote.
+        let remote_mutated = if self.overlay {
+            false
+        } else {
+            self.rename_remote(&info).await?
+        };
+
+        // Overlay mode: rename the on-disk file/directory so staging_path()
+        // (which is based on full_path) stays consistent with the physical layout.
+        if self.overlay
+            && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
+        {
+            let old_disk_path = overlay_root.join(&info.old_path);
+            let new_disk_path = overlay_root.join(&info.new_full_path);
+            if old_disk_path.exists() {
+                if let Some(parent) = new_disk_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::rename(&old_disk_path, &new_disk_path) {
+                    warn!(
+                        "Overlay rename {:?} -> {:?} failed: {}",
+                        old_disk_path, new_disk_path, e
+                    );
+                }
+            }
+        }
 
         // Phase 3: apply to local inode table under write lock.
         // If Phase 2 mutated the remote and Phase 3 fails with ENOENT (source
@@ -2661,14 +2716,14 @@ impl VirtualFs {
 
         if let Some(new_size) = size {
             // Validate inode exists and is a file before any side effects
-            {
+            let full_path = {
                 let inodes = self.inode_table.read().expect("inodes poisoned");
                 match inodes.get(ino) {
                     Some(e) if e.kind != InodeKind::File => return Err(libc::EISDIR),
+                    Some(e) => e.full_path.clone(),
                     None => return Err(libc::ENOENT),
-                    _ => {}
                 }
-            }
+            };
 
             if !self.advanced_writes {
                 // Simple mode: ftruncate via setattr is silently ignored.
@@ -2682,7 +2737,11 @@ impl VirtualFs {
                     .staging_dir
                     .as_ref()
                     .expect("staging_dir required for advanced writes")
-                    .path(ino);
+                    .staging_path(ino, &full_path)
+                    .map_err(|e| {
+                        error!("Failed to prepare staging path for ino={}: {}", ino, e);
+                        e.raw_os_error().unwrap_or(libc::EIO)
+                    })?;
 
                 // Phase 1: ensure staging file exists (may download, async).
                 if new_size > 0 && !staging_path.exists() {

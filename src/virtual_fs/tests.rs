@@ -3431,3 +3431,209 @@ fn overlay_write_persists_after_reread() {
         assert_eq!(data.as_ref(), b"hello");
     });
 }
+
+/// Unlink of a remote-only file returns EPERM in overlay mode.
+#[test]
+fn overlay_unlink_remote_only_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 5, Some("rhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_unlinkremote_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let err = t.vfs.unlink(ROOT_INODE, "remote.txt").await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+}
+
+/// Unlink of a locally-created file succeeds in overlay mode.
+#[test]
+fn overlay_unlink_local_file_ok() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_unlinklocal_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (attr, fh) = t
+            .vfs
+            .create(ROOT_INODE, "local.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"data").await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+
+        t.vfs.unlink(ROOT_INODE, "local.txt").await.unwrap();
+    });
+
+    let log = hub.take_batch_log();
+    assert!(log.is_empty(), "unlink should not send remote ops in overlay: {log:?}");
+}
+
+/// Rename of a remote-only file returns EPERM in overlay mode.
+#[test]
+fn overlay_rename_remote_only_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 5, Some("rhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_renameremote_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let err = t
+            .vfs
+            .rename(ROOT_INODE, "remote.txt", ROOT_INODE, "moved.txt", false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+}
+
+/// Rename of a locally-created file moves the on-disk overlay file.
+#[test]
+fn overlay_rename_local_moves_on_disk() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_renamedisk_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (attr, fh) = t
+            .vfs
+            .create(ROOT_INODE, "src.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"rename me").await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+
+        t.vfs
+            .rename(ROOT_INODE, "src.txt", ROOT_INODE, "dst.txt", false)
+            .await
+            .unwrap();
+    });
+
+    assert!(!t.overlay_root.join("src.txt").exists(), "old path should be gone");
+    assert_eq!(
+        std::fs::read_to_string(t.overlay_root.join("dst.txt")).unwrap(),
+        "rename me"
+    );
+
+    let log = hub.take_batch_log();
+    assert!(log.is_empty(), "rename should not send remote ops in overlay: {log:?}");
+}
+
+/// setattr truncation in overlay mode writes to the correct overlay path.
+#[test]
+fn overlay_setattr_truncate_uses_overlay_path() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_setattr_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (attr, fh) = t
+            .vfs
+            .create(ROOT_INODE, "trunc.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, attr.ino, fh, 0, b"hello world").await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+
+        // Truncate via setattr
+        t.vfs
+            .setattr(attr.ino, Some(5), None, None, None, None, None)
+            .await
+            .unwrap();
+
+        // Re-read: should be 5 bytes
+        let fh2 = t.vfs.open(attr.ino, false, false, None).await.unwrap();
+        let (data, _eof) = t.vfs.read(fh2, 0, 1024).await.unwrap();
+        assert_eq!(data.len(), 5);
+    });
+
+    // The truncated file should exist at the overlay path, not an inode-based path
+    assert!(t.overlay_root.join("trunc.txt").exists());
+}
+
+/// When a local file shadows a remote file, xet_hash is cleared so the
+/// shadowed entry is treated as local (not remote-only). This means
+/// unlink succeeds instead of returning EPERM.
+#[test]
+fn overlay_local_shadow_clears_xet_hash() {
+    let hub = MockHub::new();
+    hub.add_file("config.txt", 6, Some("remote_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("remote_hash", b"remote");
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_shadow_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    std::fs::write(overlay_root.join("config.txt"), b"local override").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        // Unlink should succeed — the local shadow cleared xet_hash,
+        // so this is treated as a local (dirty) file, not remote-only.
+        t.vfs.unlink(ROOT_INODE, "config.txt").await.unwrap();
+    });
+
+    let log = hub.take_batch_log();
+    assert!(log.is_empty(), "no remote ops for shadowed file: {log:?}");
+}
+
+/// OS junk files in the overlay directory are filtered out of readdir.
+#[test]
+fn overlay_filters_os_junk() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_junk_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    std::fs::write(overlay_root.join(".DS_Store"), b"junk").unwrap();
+    std::fs::write(overlay_root.join("real.txt"), b"keep").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"real.txt"), "real.txt should be visible");
+        assert!(!names.contains(&".DS_Store"), ".DS_Store should be filtered");
+    });
+}
+
+/// Symlinks in the overlay directory are skipped during readdir merge.
+#[test]
+fn overlay_skips_symlinks() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_symlink_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    std::fs::write(overlay_root.join("real.txt"), b"content").unwrap();
+    // Create a symlink — should be ignored by overlay merge
+    let _ = std::os::unix::fs::symlink(overlay_root.join("real.txt"), overlay_root.join("link.txt"));
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"real.txt"), "real.txt should be visible");
+        assert!(!names.contains(&"link.txt"), "symlinks should be skipped");
+    });
+}
