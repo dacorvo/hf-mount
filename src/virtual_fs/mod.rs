@@ -550,6 +550,15 @@ impl VirtualFs {
                         use std::os::unix::fs::PermissionsExt;
                         (metadata.permissions().mode() & 0o777) as u16
                     };
+                    // If existing entry has a different kind (e.g. remote file
+                    // vs local dir), remove it first so local wins cleanly.
+                    let conflict = inodes
+                        .lookup_child(parent_ino, &name)
+                        .filter(|e| e.kind != kind)
+                        .map(|e| e.inode);
+                    if let Some(old_ino) = conflict {
+                        inodes.remove(old_ino);
+                    }
                     let ino = inodes.insert(
                         parent_ino, name, full_path, kind, size, mtime, None, mode, self.uid, self.gid,
                     );
@@ -2271,14 +2280,27 @@ impl VirtualFs {
         // Re-check ENOTEMPTY + remove under a single write lock to prevent
         // a concurrent create/mkdir from inserting a child in between.
         let mut inodes = self.inode_table.write().expect("inodes poisoned");
-        match inodes.get(ino) {
+        let full_path = match inodes.get(ino) {
             Some(entry) if !entry.children.is_empty() => return Err(libc::ENOTEMPTY),
+            Some(entry) => entry.full_path.clone(),
             None => return Err(libc::ENOENT),
-            _ => {}
+        };
+
+        // Overlay: remove on-disk dir before inode, so failure doesn't leave stale state.
+        if self.overlay
+            && let Some(overlay_root) = self.staging_dir.as_ref().and_then(|sd| sd.overlay_root())
+        {
+            let dir_path = overlay_root.join(&full_path);
+            if let Err(e) = std::fs::remove_dir(&dir_path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            }
         }
+
         inodes.remove(ino);
-        // nlink adjusted by remove()
         inodes.touch_parent(parent, SystemTime::now());
+
         Ok(())
     }
 

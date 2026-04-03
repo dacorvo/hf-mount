@@ -3678,3 +3678,50 @@ fn overlay_mkdir_marks_dirty() {
         assert!(entry.is_dirty(), "overlay mkdir should mark directory as dirty");
     });
 }
+
+/// rmdir in overlay mode removes the on-disk directory.
+#[test]
+fn overlay_rmdir_removes_on_disk() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("rmdir");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        t.vfs.mkdir(ROOT_INODE, "mydir", 0o755, 1000, 1000).await.unwrap();
+        assert!(t.overlay_root.join("mydir").is_dir());
+
+        t.vfs.rmdir(ROOT_INODE, "mydir").await.unwrap();
+    });
+
+    assert!(
+        !t.overlay_root.join("mydir").exists(),
+        "rmdir should remove on-disk overlay directory"
+    );
+}
+
+/// Overlay merge handles type conflicts: local dir shadows remote file.
+#[test]
+fn overlay_type_conflict_local_dir_wins() {
+    let hub = MockHub::new();
+    hub.add_file("conflict", 5, Some("rhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("typeconflict");
+    // Local has a directory where remote has a file
+    std::fs::create_dir_all(overlay_root.join("conflict")).unwrap();
+    std::fs::write(overlay_root.join("conflict/inner.txt"), b"data").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let entry = entries
+            .iter()
+            .find(|e| e.name == "conflict")
+            .expect("conflict should exist");
+        // Local directory should win over remote file
+        assert_eq!(entry.kind, InodeKind::Directory);
+    });
+}
