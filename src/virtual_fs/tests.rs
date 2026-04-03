@@ -3183,3 +3183,252 @@ fn rename_clean_file_remote_and_local() {
         assert_eq!(entry.full_path, "dst.txt");
     });
 }
+
+// ── Overlay mode tests ─────────────────────────────────────────────
+
+use crate::test_mocks::make_overlay_test_vfs_with_root;
+
+/// Readdir merges remote bucket entries with local overlay files.
+#[test]
+fn overlay_readdir_merges_local_and_remote() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 5, Some("rhash"), None);
+    let xet = MockXet::new();
+
+    // Pre-populate overlay root BEFORE VFS creation
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_readdir_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    std::fs::write(overlay_root.join("local.txt"), b"local data").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"remote.txt"), "missing remote.txt: {names:?}");
+        assert!(names.contains(&"local.txt"), "missing local.txt: {names:?}");
+    });
+}
+
+/// Read a file that only exists locally in the overlay dir.
+#[test]
+fn overlay_read_local_file() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_readlocal_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    std::fs::write(overlay_root.join("data.txt"), b"hello overlay").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries
+            .iter()
+            .find(|e| e.name == "data.txt")
+            .expect("data.txt not in readdir")
+            .ino;
+
+        let fh = t.vfs.open(ino, false, false, None).await.unwrap();
+        let (data, _eof) = t.vfs.read(fh, 0, 1024).await.unwrap();
+        assert_eq!(data.as_ref(), b"hello overlay");
+    });
+}
+
+/// Local file takes precedence over remote file with the same name.
+#[test]
+fn overlay_local_overrides_remote() {
+    let hub = MockHub::new();
+    hub.add_file("conflict.txt", 6, Some("remote_hash"), None);
+    let xet = MockXet::new();
+    xet.add_file("remote_hash", b"remote");
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_conflict_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    std::fs::write(overlay_root.join("conflict.txt"), b"local wins").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "conflict.txt").unwrap().ino;
+
+        // Size should reflect local file
+        let attr = t.vfs.getattr(ino).unwrap();
+        assert_eq!(attr.size, 10); // "local wins" = 10 bytes
+
+        let fh = t.vfs.open(ino, false, false, None).await.unwrap();
+        let (data, _eof) = t.vfs.read(fh, 0, 1024).await.unwrap();
+        assert_eq!(data.as_ref(), b"local wins");
+    });
+}
+
+/// Writes via VFS land at the original path in the overlay root dir.
+#[test]
+fn overlay_write_lands_at_original_path() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_write_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (_, fh) = t
+            .vfs
+            .create(ROOT_INODE, "new.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, 2, fh, 0, b"written via vfs").await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+    });
+
+    let on_disk = std::fs::read_to_string(t.overlay_root.join("new.txt")).unwrap();
+    assert_eq!(on_disk, "written via vfs");
+}
+
+/// mkdir via VFS creates a real directory in the overlay root.
+#[test]
+fn overlay_mkdir_creates_local_dir() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_mkdir_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        t.vfs.mkdir(ROOT_INODE, "subdir", 0o755, 1000, 1000).await.unwrap();
+    });
+
+    assert!(t.overlay_root.join("subdir").is_dir());
+}
+
+/// In overlay mode, no batch ops are sent to the remote hub.
+#[test]
+fn overlay_no_flush_manager() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_noflush_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (_, fh) = t
+            .vfs
+            .create(ROOT_INODE, "nopush.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, 2, fh, 0, b"data").await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+    });
+
+    let log = hub.take_batch_log();
+    assert!(log.is_empty(), "expected no remote ops, got: {log:?}");
+}
+
+/// fsync in overlay mode does not upload to remote.
+#[test]
+fn overlay_fsync_no_upload() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_fsync_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (_, fh) = t
+            .vfs
+            .create(ROOT_INODE, "synced.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        write_blocking(&t.vfs, 2, fh, 0, b"data").await.unwrap();
+        t.vfs.fsync(2, fh, None).await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+    });
+
+    let log = hub.take_batch_log();
+    assert!(log.is_empty(), "expected no remote ops after fsync, got: {log:?}");
+}
+
+/// Nested local directories are discovered through readdir.
+#[test]
+fn overlay_nested_readdir() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_nested_{}", std::process::id()));
+    std::fs::create_dir_all(overlay_root.join("dir1")).unwrap();
+    std::fs::write(overlay_root.join("dir1/file1.txt"), b"nested content").unwrap();
+
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        // Root should list dir1
+        let root_entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let dir1_entry = root_entries
+            .iter()
+            .find(|e| e.name == "dir1")
+            .expect("dir1 not in root readdir");
+
+        // dir1 should list file1.txt
+        let dir1_entries = t.vfs.readdir(dir1_entry.ino).await.unwrap();
+        let names: Vec<&str> = dir1_entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"file1.txt"), "missing file1.txt in dir1: {names:?}");
+    });
+}
+
+/// Remote files are still readable when no local override exists.
+#[test]
+fn overlay_read_remote_file() {
+    let hub = MockHub::new();
+    hub.add_file("remote_only.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+    xet.add_file("xhash", b"remote data");
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_remote_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote_only.txt").unwrap().ino;
+
+        let fh = t.vfs.open(ino, false, false, None).await.unwrap();
+        let (data, _eof) = t.vfs.read(fh, 0, 1024).await.unwrap();
+        assert_eq!(data.as_ref(), b"remote data");
+    });
+
+    // File should NOT appear in overlay root
+    assert!(!t.overlay_root.join("remote_only.txt").exists());
+}
+
+/// Data written via VFS is readable back in the same session.
+#[test]
+fn overlay_write_persists_after_reread() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_reread_{}", std::process::id()));
+    std::fs::create_dir_all(&overlay_root).unwrap();
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let (_, fh) = t
+            .vfs
+            .create(ROOT_INODE, "reread.txt", 0o644, 1000, 1000, None)
+            .await
+            .unwrap();
+        let ino = 2; // first created inode after root
+        write_blocking(&t.vfs, ino, fh, 0, b"hello").await.unwrap();
+        t.vfs.release(fh).await.unwrap();
+
+        // Re-open read-only
+        let fh2 = t.vfs.open(ino, false, false, None).await.unwrap();
+        let (data, _eof) = t.vfs.read(fh2, 0, 1024).await.unwrap();
+        assert_eq!(data.as_ref(), b"hello");
+    });
+}
