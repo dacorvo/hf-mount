@@ -2063,6 +2063,10 @@ impl VirtualFs {
             );
             if let Some(entry) = inodes.get_mut(ino) {
                 entry.children_loaded = true;
+                // Overlay: mark as dirty so stale-child pruning won't remove it
+                if self.overlay {
+                    entry.set_dirty();
+                }
             }
             // nlink already incremented by insert()
             inodes.touch_parent(parent, now);
@@ -2320,8 +2324,9 @@ impl VirtualFs {
             self.ensure_children_loaded(newparent).await?;
         }
 
-        // Overlay mode: remote-only entries cannot be renamed (no whiteout for old path).
-        // Local or COW'd entries (dirty) can be renamed freely.
+        // Overlay mode: clean (non-local) entries cannot be renamed — no whiteout
+        // for the old path and no remote mutation. This covers remote files (xet_hash),
+        // etag-based files, and remote directories.
         if self.overlay
             && let Some(src) = self
                 .inode_table
@@ -2329,7 +2334,6 @@ impl VirtualFs {
                 .expect("inodes poisoned")
                 .lookup_child(parent, name)
             && !src.is_dirty()
-            && src.xet_hash.is_some()
         {
             return Err(libc::EPERM);
         }
@@ -2385,20 +2389,23 @@ impl VirtualFs {
         {
             let old_disk_path = overlay_root.join(&info.old_path);
             let new_disk_path = overlay_root.join(&info.new_full_path);
-            if old_disk_path.exists() {
-                if let Some(parent) = new_disk_path.parent()
-                    && let Err(e) = std::fs::create_dir_all(parent)
-                {
-                    error!("Overlay rename: failed to create {:?}: {}", parent, e);
-                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
-                }
-                if let Err(e) = std::fs::rename(&old_disk_path, &new_disk_path) {
-                    error!(
-                        "Overlay rename {:?} -> {:?} failed: {}",
-                        old_disk_path, new_disk_path, e
-                    );
-                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
-                }
+            if !old_disk_path.exists() {
+                // Source not materialized locally — rename would have no effect
+                // on disk, and the old name would reappear on next directory reload.
+                return Err(libc::EPERM);
+            }
+            if let Some(parent) = new_disk_path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                error!("Overlay rename: failed to create {:?}: {}", parent, e);
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+            }
+            if let Err(e) = std::fs::rename(&old_disk_path, &new_disk_path) {
+                error!(
+                    "Overlay rename {:?} -> {:?} failed: {}",
+                    old_disk_path, new_disk_path, e
+                );
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
             }
         }
 

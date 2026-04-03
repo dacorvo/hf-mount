@@ -3638,3 +3638,43 @@ fn overlay_skips_symlinks() {
         assert!(!names.contains(&"link.txt"), "symlinks should be skipped");
     });
 }
+
+/// Rename of a clean remote directory returns EPERM in overlay mode.
+#[test]
+fn overlay_rename_remote_dir_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("subdir/file.txt", 5, Some("rhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("renamedir");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        // Load root to discover subdir
+        t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let err = t
+            .vfs
+            .rename(ROOT_INODE, "subdir", ROOT_INODE, "moved", false)
+            .await
+            .unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+}
+
+/// mkdir in overlay mode marks the directory as dirty so it survives
+/// stale-child pruning on reload.
+#[test]
+fn overlay_mkdir_marks_dirty() {
+    let hub = MockHub::new();
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("mkdirdirty");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let attr = t.vfs.mkdir(ROOT_INODE, "newdir", 0o755, 1000, 1000).await.unwrap();
+        let inodes = t.vfs.inode_table.read().expect("inodes poisoned");
+        let entry = inodes.get(attr.ino).expect("directory inode should exist");
+        assert!(entry.is_dirty(), "overlay mkdir should mark directory as dirty");
+    });
+}
