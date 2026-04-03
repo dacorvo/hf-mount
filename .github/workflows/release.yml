@@ -48,13 +48,14 @@ jobs:
         run: |
           T="${{ matrix.target }}"
           cargo build --release --target $T --no-default-features --features fuse,vendored-openssl --bin hf-mount-fuse
+          cargo build --release --target $T --no-default-features --features fuse,vendored-openssl --bin hf-mount-fuse-sidecar
           cargo build --release --target $T --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
           cargo build --release --target $T --no-default-features --features vendored-openssl --bin hf-mount
 
       - name: Package
         run: |
           mkdir -p dist
-          for bin in hf-mount-fuse hf-mount-nfs hf-mount; do
+          for bin in hf-mount-fuse hf-mount-fuse-sidecar hf-mount-nfs hf-mount; do
             cp target/${{ matrix.target }}/release/$bin dist/${bin}-${{ matrix.arch }}-linux
           done
           chmod +x dist/*
@@ -91,13 +92,14 @@ jobs:
         run: |
           T="${{ matrix.target }}"
           cargo build --release --target $T --no-default-features --features fuse,vendored-openssl --bin hf-mount-fuse
+          cargo build --release --target $T --no-default-features --features fuse,vendored-openssl --bin hf-mount-fuse-sidecar
           cargo build --release --target $T --no-default-features --features nfs,vendored-openssl --bin hf-mount-nfs
           cargo build --release --target $T --no-default-features --features vendored-openssl --bin hf-mount
 
       - name: Package
         run: |
           mkdir -p dist
-          for bin in hf-mount-fuse hf-mount-nfs hf-mount; do
+          for bin in hf-mount-fuse hf-mount-fuse-sidecar hf-mount-nfs hf-mount; do
             cp target/${{ matrix.target }}/release/$bin dist/${bin}-${{ matrix.arch }}-apple-darwin
           done
           chmod +x dist/*
