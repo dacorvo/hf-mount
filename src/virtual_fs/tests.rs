@@ -5,6 +5,16 @@ use super::*;
 use crate::hub_api::HeadFileInfo;
 use crate::test_mocks::{MockHub, MockXet, TestOpts, make_overlay_test_vfs_with_root, make_test_vfs};
 
+/// Create a fresh overlay temp dir, removing any stale contents from previous runs.
+fn fresh_overlay_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("hf_overlay_{}_{}", name, std::process::id()));
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("failed to clean stale overlay dir");
+    }
+    std::fs::create_dir_all(&dir).expect("failed to create overlay dir");
+    dir
+}
+
 fn new_runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -3194,8 +3204,7 @@ fn overlay_readdir_merges_local_and_remote() {
     let xet = MockXet::new();
 
     // Pre-populate overlay root BEFORE VFS creation
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_readdir_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("readdir");
     std::fs::write(overlay_root.join("local.txt"), b"local data").unwrap();
 
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
@@ -3214,8 +3223,7 @@ fn overlay_read_local_file() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_readlocal_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("readlocal");
     std::fs::write(overlay_root.join("data.txt"), b"hello overlay").unwrap();
 
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
@@ -3242,8 +3250,7 @@ fn overlay_local_overrides_remote() {
     let xet = MockXet::new();
     xet.add_file("remote_hash", b"remote");
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_conflict_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("conflict");
     std::fs::write(overlay_root.join("conflict.txt"), b"local wins").unwrap();
 
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
@@ -3268,8 +3275,7 @@ fn overlay_write_lands_at_original_path() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_write_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("write");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3294,8 +3300,7 @@ fn overlay_mkdir_creates_local_dir() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_mkdir_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("mkdir");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3311,8 +3316,7 @@ fn overlay_no_flush_manager() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_noflush_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("noflush");
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3335,8 +3339,7 @@ fn overlay_fsync_no_upload() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_fsync_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("fsync");
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3360,7 +3363,7 @@ fn overlay_nested_readdir() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_nested_{}", std::process::id()));
+    let overlay_root = fresh_overlay_dir("nested");
     std::fs::create_dir_all(overlay_root.join("dir1")).unwrap();
     std::fs::write(overlay_root.join("dir1/file1.txt"), b"nested content").unwrap();
 
@@ -3389,8 +3392,7 @@ fn overlay_read_remote_file() {
     let xet = MockXet::new();
     xet.add_file("xhash", b"remote data");
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_remote_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("remote");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3412,8 +3414,7 @@ fn overlay_write_persists_after_reread() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_reread_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("reread");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3439,8 +3440,7 @@ fn overlay_unlink_remote_only_eperm() {
     hub.add_file("remote.txt", 5, Some("rhash"), None);
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_unlinkremote_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("unlinkremote");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3456,8 +3456,7 @@ fn overlay_unlink_local_file_ok() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_unlinklocal_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("unlinklocal");
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3483,8 +3482,7 @@ fn overlay_rename_remote_only_eperm() {
     hub.add_file("remote.txt", 5, Some("rhash"), None);
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_renameremote_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("renameremote");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3504,8 +3502,7 @@ fn overlay_rename_local_moves_on_disk() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_renamedisk_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("renamedisk");
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3539,8 +3536,7 @@ fn overlay_setattr_truncate_uses_overlay_path() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_setattr_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("setattr");
     let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
 
     t.runtime.block_on(async {
@@ -3578,8 +3574,7 @@ fn overlay_local_shadow_clears_xet_hash() {
     let xet = MockXet::new();
     xet.add_file("remote_hash", b"remote");
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_shadow_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("shadow");
     std::fs::write(overlay_root.join("config.txt"), b"local override").unwrap();
 
     let t = make_overlay_test_vfs_with_root(hub.clone(), xet, overlay_root);
@@ -3601,8 +3596,7 @@ fn overlay_filters_os_junk() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_junk_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("junk");
     std::fs::write(overlay_root.join(".DS_Store"), b"junk").unwrap();
     std::fs::write(overlay_root.join("real.txt"), b"keep").unwrap();
 
@@ -3622,8 +3616,7 @@ fn overlay_skips_symlinks() {
     let hub = MockHub::new();
     let xet = MockXet::new();
 
-    let overlay_root = std::env::temp_dir().join(format!("hf_overlay_symlink_{}", std::process::id()));
-    std::fs::create_dir_all(&overlay_root).unwrap();
+    let overlay_root = fresh_overlay_dir("symlink");
     std::fs::write(overlay_root.join("real.txt"), b"content").unwrap();
     // Create a symlink — should be ignored by overlay merge
     let _ = std::os::unix::fs::symlink(overlay_root.join("real.txt"), overlay_root.join("link.txt"));

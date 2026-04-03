@@ -485,6 +485,9 @@ pub fn make_test_vfs(
         std::fs::create_dir_all(&path).expect("failed to create temp staging dir");
         if opts.overlay {
             let overlay_root = std::env::temp_dir().join(format!("hf_mount_overlay_{}", std::process::id()));
+            if overlay_root.exists() {
+                std::fs::remove_dir_all(&overlay_root).expect("failed to clean stale overlay dir");
+            }
             std::fs::create_dir_all(&overlay_root).expect("failed to create overlay root dir");
             Some(StagingDir::new_overlay(&path, overlay_root))
         } else {

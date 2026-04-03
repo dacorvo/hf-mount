@@ -1005,12 +1005,17 @@ impl VirtualFs {
         let staging_path = self
             .staging_dir
             .as_ref()
-            .map(|sd| sd.staging_path(ino, &file_entry.full_path))
-            .transpose()
-            .map_err(|e| {
-                error!("Failed to prepare staging path for ino={}: {}", ino, e);
+            .map(|sd| sd.staging_path(ino, &file_entry.full_path));
+
+        // Ensure overlay parent dirs exist before any write path
+        if writable
+            && let Some(sd) = &self.staging_dir
+        {
+            sd.ensure_staging_parents(&file_entry.full_path).map_err(|e| {
+                error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
                 libc::EIO
             })?;
+        }
 
         if writable && self.advanced_writes {
             // Staging file + async flush (supports random writes and seek)
@@ -1945,19 +1950,16 @@ impl VirtualFs {
 
         if self.advanced_writes {
             // Advanced mode: staging file on disk + async flush
-            let staging_path = match self
+            let sd = self
                 .staging_dir
                 .as_ref()
-                .expect("staging_dir required for advanced writes")
-                .staging_path(ino, &full_path)
-            {
-                Ok(p) => p,
-                Err(e) => {
-                    error!("Failed to prepare staging path for {}: {}", full_path, e);
-                    self.inode_table.write().expect("inodes poisoned").remove(ino);
-                    return Err(libc::EIO);
-                }
-            };
+                .expect("staging_dir required for advanced writes");
+            if let Err(e) = sd.ensure_staging_parents(&full_path) {
+                error!("Failed to create staging parent dirs for {}: {}", full_path, e);
+                self.inode_table.write().expect("inodes poisoned").remove(ino);
+                return Err(libc::EIO);
+            }
+            let staging_path = sd.staging_path(ino, &full_path);
             match OpenOptions::new()
                 .create(true)
                 .truncate(true)
@@ -2165,8 +2167,7 @@ impl VirtualFs {
         // Clean up staging file only if inode was fully removed (no remaining hard links)
         if inode_removed
             && let Some(ref staging_dir) = self.staging_dir
-            && let Ok(staging_path) = staging_dir.staging_path(ino, &full_path)
-            && let Err(e) = std::fs::remove_file(&staging_path)
+            && let Err(e) = std::fs::remove_file(staging_dir.staging_path(ino, &full_path))
             && e.kind() != std::io::ErrorKind::NotFound
         {
             warn!("Failed to remove staging file for ino={}: {}", ino, e);
@@ -2387,14 +2388,18 @@ impl VirtualFs {
             let old_disk_path = overlay_root.join(&info.old_path);
             let new_disk_path = overlay_root.join(&info.new_full_path);
             if old_disk_path.exists() {
-                if let Some(parent) = new_disk_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                if let Some(parent) = new_disk_path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    error!("Overlay rename: failed to create {:?}: {}", parent, e);
+                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
                 }
                 if let Err(e) = std::fs::rename(&old_disk_path, &new_disk_path) {
-                    warn!(
+                    error!(
                         "Overlay rename {:?} -> {:?} failed: {}",
                         old_disk_path, new_disk_path, e
                     );
+                    return Err(e.raw_os_error().unwrap_or(libc::EIO));
                 }
             }
         }
@@ -2733,15 +2738,15 @@ impl VirtualFs {
                 let staging_mutex = self.staging_lock(ino);
                 let _staging_guard = staging_mutex.lock().await;
 
-                let staging_path = self
+                let sd = self
                     .staging_dir
                     .as_ref()
-                    .expect("staging_dir required for advanced writes")
-                    .staging_path(ino, &full_path)
-                    .map_err(|e| {
-                        error!("Failed to prepare staging path for ino={}: {}", ino, e);
-                        e.raw_os_error().unwrap_or(libc::EIO)
-                    })?;
+                    .expect("staging_dir required for advanced writes");
+                sd.ensure_staging_parents(&full_path).map_err(|e| {
+                    error!("Failed to create staging parent dirs for ino={}: {}", ino, e);
+                    e.raw_os_error().unwrap_or(libc::EIO)
+                })?;
+                let staging_path = sd.staging_path(ino, &full_path);
 
                 // Phase 1: ensure staging file exists (may download, async).
                 if new_size > 0 && !staging_path.exists() {
