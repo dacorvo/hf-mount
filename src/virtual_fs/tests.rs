@@ -3466,6 +3466,50 @@ fn overlay_read_remote_file() {
     assert!(!t.overlay_root.join("remote_only.txt").exists());
 }
 
+/// Remote-only files cannot be opened writable in overlay mode.
+#[test]
+fn overlay_open_remote_write_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+    xet.add_file("xhash", b"remote data");
+
+    let overlay_root = fresh_overlay_dir("openremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote.txt").unwrap().ino;
+
+        let err = t.vfs.open(ino, true, false, None).await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+
+    assert!(!t.overlay_root.join("remote.txt").exists());
+}
+
+/// O_TRUNC on a remote-only file is rejected in overlay mode.
+#[test]
+fn overlay_open_remote_truncate_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+    xet.add_file("xhash", b"remote data");
+
+    let overlay_root = fresh_overlay_dir("truncremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote.txt").unwrap().ino;
+
+        let err = t.vfs.open(ino, true, true, None).await.unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+
+    assert!(!t.overlay_root.join("remote.txt").exists());
+}
+
 /// Data written via VFS is readable back in the same session.
 #[test]
 fn overlay_write_persists_after_reread() {
@@ -3620,6 +3664,31 @@ fn overlay_setattr_truncate_uses_overlay_path() {
 
     // The truncated file should exist at the overlay path, not an inode-based path
     assert!(t.overlay_root.join("trunc.txt").exists());
+}
+
+/// setattr truncation of a clean remote file is rejected in overlay mode.
+#[test]
+fn overlay_setattr_remote_truncate_eperm() {
+    let hub = MockHub::new();
+    hub.add_file("remote.txt", 11, Some("xhash"), None);
+    let xet = MockXet::new();
+
+    let overlay_root = fresh_overlay_dir("setattrremote");
+    let t = make_overlay_test_vfs_with_root(hub, xet, overlay_root);
+
+    t.runtime.block_on(async {
+        let entries = t.vfs.readdir(ROOT_INODE).await.unwrap();
+        let ino = entries.iter().find(|e| e.name == "remote.txt").unwrap().ino;
+
+        let err = t
+            .vfs
+            .setattr(ino, Some(0), None, None, None, None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, libc::EPERM);
+    });
+
+    assert!(!t.overlay_root.join("remote.txt").exists());
 }
 
 /// When a local file shadows a remote file, xet_hash is cleared so the

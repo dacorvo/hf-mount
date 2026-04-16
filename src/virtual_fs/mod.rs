@@ -2799,34 +2799,13 @@ impl VirtualFs {
                             (entry.xet_hash.clone().unwrap_or_default(), entry.size)
                         };
                         if !xet_hash.is_empty() && file_size > 0 {
-                            if self.overlay {
-                                let temp_path = sd.path(ino);
-                                if let Err(e) = self
-                                    .xet_sessions
-                                    .download_to_file(&xet_hash, file_size, &temp_path)
-                                    .await
-                                {
-                                    error!("Failed to download file for truncate: {}", e);
-                                    return Err(libc::EIO);
-                                }
-                                if let Err(e) = sd.overlay_copy_from_path(&full_path, &temp_path) {
-                                    error!("Failed to materialize overlay file for truncate: {}", e);
-                                    return Err(libc::EIO);
-                                }
-                                let _ = std::fs::remove_file(&temp_path);
-                            } else {
-                                let staging_path = sd.staging_path(ino, &full_path).map_err(|e| {
-                                    error!("Invalid staging path for ino={}: {}", ino, e);
-                                    libc::EIO
-                                })?;
-                                if let Err(e) = self
-                                    .xet_sessions
-                                    .download_to_file(&xet_hash, file_size, &staging_path)
-                                    .await
-                                {
-                                    error!("Failed to download file for truncate: {}", e);
-                                    return Err(libc::EIO);
-                                }
+                            if let Err(e) = self
+                                .xet_sessions
+                                .download_to_file(&xet_hash, file_size, &staging_path)
+                                .await
+                            {
+                                error!("Failed to download file for truncate: {}", e);
+                                return Err(libc::EIO);
                             }
                         } else if let Err(e) = self.open_local_backing_file(ino, &full_path, true, true, true, true)
                         {
