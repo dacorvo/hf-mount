@@ -42,42 +42,59 @@ impl NFSAdapter {
         }
     }
 
-    /// Get or open a file handle from the pool.
+    /// Get or open a pooled read handle with a shared pin. Cold-read races
+    /// converge on a single pooled handle so the per-handle prefetch buffer
+    /// absorbs concurrent NFS readahead RPCs instead of spawning duplicate
+    /// Xet streams.
     async fn get_or_open_handle(&self, ino: u64) -> Result<u64, nfsstat3> {
-        // Check pool first (quick lock)
-        if let Some(file_handle) = self.handle_pool.lock().expect("handle_pool poisoned").get(ino) {
-            return Ok(file_handle);
+        if let Some(handle) = self.acquire_shared(ino) {
+            return Ok(handle);
         }
-        // Pool miss: open file (may await download)
-        let file_handle = self
-            .virtual_fs
-            .open(ino, false, false, None)
-            .await
-            .map_err(errno_to_nfs)?;
-        // Insert into pool (evict LRU if full)
-        let (result, dup_handle) = {
+        let file_handle = match self.virtual_fs.open(ino, false, false, None).await {
+            Ok(handle) => handle,
+            Err(err) => return self.acquire_shared(ino).ok_or_else(|| errno_to_nfs(err)),
+        };
+
+        enum Outcome {
+            ShareExisting(u64),
+            Inserted(InsertResult),
+        }
+        let outcome = {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-            // Double-check: another task may have opened it concurrently
-            if let Some(existing) = pool.get(ino) {
-                (None, Some((existing, file_handle)))
+            if let Some(existing) = pool.acquire_shared(ino) {
+                Outcome::ShareExisting(existing)
             } else {
-                (Some(pool.insert(ino, file_handle)), None)
+                let result = pool.insert(ino, file_handle);
+                pool.acquire_shared(ino);
+                Outcome::Inserted(result)
             }
         };
-        // Release duplicate handle outside the lock (release is async).
-        if let Some((existing, dup)) = dup_handle {
-            let _ = self.virtual_fs.release(dup).await;
-            return Ok(existing);
-        }
-        if let Some(result) = result {
-            if let Some((evicted_ino, evicted_handle)) = result.evicted {
-                self.evict_handle(evicted_ino, evicted_handle).await;
+        match outcome {
+            Outcome::ShareExisting(existing) => {
+                let _ = self.virtual_fs.release(file_handle).await;
+                Ok(existing)
             }
-            if let Some(replaced_handle) = result.replaced {
-                let _ = self.virtual_fs.release(replaced_handle).await;
+            Outcome::Inserted(result) => {
+                self.process_insert_result(result).await;
+                Ok(file_handle)
             }
         }
-        Ok(file_handle)
+    }
+
+    fn acquire_shared(&self, ino: u64) -> Option<u64> {
+        self.handle_pool
+            .lock()
+            .expect("handle_pool poisoned")
+            .acquire_shared(ino)
+    }
+
+    async fn process_insert_result(&self, result: InsertResult) {
+        for (evicted_ino, evicted_handle) in result.evicted {
+            self.evict_handle(evicted_ino, evicted_handle).await;
+        }
+        if let Some(replaced_handle) = result.replaced {
+            let _ = self.virtual_fs.release(replaced_handle).await;
+        }
     }
 
     /// Create a file and insert the handle into the pool.
@@ -107,7 +124,7 @@ impl NFSAdapter {
             let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
             pool.insert(ino, file_handle)
         };
-        if let Some((evicted_ino, evicted_handle)) = result.evicted {
+        for (evicted_ino, evicted_handle) in result.evicted {
             self.evict_handle(evicted_ino, evicted_handle).await;
         }
         if let Some(replaced_handle) = result.replaced {
@@ -147,37 +164,40 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let file_handle = self.get_or_open_handle(id).await?;
-        match self.virtual_fs.read(file_handle, offset, count).await {
+        // Share the pooled handle across concurrent readers — its prefetch
+        // buffer absorbs NFS readahead RPCs efficiently. The shared pin only
+        // blocks LRU eviction; concurrent reads still serialize on the
+        // per-handle prefetch mutex inside virtual_fs.
+        let file_handle = match self.acquire_shared(id) {
+            Some(handle) => handle,
+            None => self.get_or_open_handle(id).await?,
+        };
+
+        let result = self.virtual_fs.read(file_handle, offset, count).await;
+        self.handle_pool.lock().expect("handle_pool poisoned").unpin(id);
+
+        match result {
             Ok((bytes, eof)) => Ok((bytes.to_vec(), eof)),
             Err(libc::EBADF) => {
-                // Handle was evicted by a concurrent operation between
-                // get_or_open_handle and read. Purge stale pool entry and retry
-                // internally (returning STALE would be treated as a hard error
-                // by some NFS clients instead of a transparent retry).
-                //
-                // Only evict+release if the pool still holds the same stale handle.
-                // If another task already replaced it, the old handle was released
-                // by that task's eviction (insert/get_or_open_handle path).
-                let stale = {
+                // unlink/rename can remove() a pinned entry while a read is
+                // in flight. Drop the stale entry and retry once with a
+                // freshly-opened handle outside the pool.
+                {
                     let mut pool = self.handle_pool.lock().expect("handle_pool poisoned");
-                    if pool.get(id) == Some(file_handle) {
-                        pool.remove(id)
-                    } else {
-                        None
+                    if pool.peek(id) == Some(file_handle) {
+                        pool.remove(id);
                     }
-                };
-                if let Some(stale_handle) = stale {
-                    let _ = self.virtual_fs.release(stale_handle).await;
                 }
-                let file_handle = self.get_or_open_handle(id).await?;
-                self.virtual_fs
-                    .read(file_handle, offset, count)
+                let handle = self
+                    .virtual_fs
+                    .open(id, false, false, None)
                     .await
-                    .map(|(b, eof)| (b.to_vec(), eof))
-                    .map_err(errno_to_nfs)
+                    .map_err(errno_to_nfs)?;
+                let result = self.virtual_fs.read(handle, offset, count).await;
+                let _ = self.virtual_fs.release(handle).await;
+                result.map(|(b, eof)| (b.to_vec(), eof)).map_err(errno_to_nfs)
             }
-            Err(e) => Err(errno_to_nfs(e)),
+            Err(err) => Err(errno_to_nfs(err)),
         }
     }
 
@@ -254,12 +274,13 @@ impl NFSFileSystem for NFSAdapter {
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
-        // Write requires a handle already in the pool (from create).
+        // virtual_fs.write is synchronous pwrite — no yield point where the
+        // pool could evict, so peek without pinning.
         let file_handle = self
             .handle_pool
             .lock()
             .expect("handle_pool poisoned")
-            .get(id)
+            .peek(id)
             .ok_or(nfsstat3::NFS3ERR_STALE)?;
         // NFS always uses advanced_writes (staging files), so write() is a
         // synchronous pwrite() — safe to call from async context.
@@ -573,15 +594,23 @@ pub async fn mount_nfs(
 const HANDLE_POOL_CAPACITY: usize = 64;
 
 struct InsertResult {
-    /// LRU eviction of a different ino (pool was full).
-    evicted: Option<(u64, u64)>,
+    /// LRU evictions of unpinned entries to bring the pool back to capacity.
+    evicted: Vec<(u64, u64)>,
     /// Replaced handle for the same ino (e.g. read -> write upgrade).
     replaced: Option<u64>,
 }
 
+struct HandleEntry {
+    file_handle: u64,
+    /// Number of in-flight operations using this handle. Pinned entries
+    /// (pin_count > 0) are skipped during LRU eviction so that concurrent
+    /// reads never encounter a released handle.
+    pin_count: u32,
+}
+
 struct HandlePool {
-    handles: HashMap<u64, u64>, // ino -> file_handle
-    order: VecDeque<u64>,       // ino access order (front = oldest)
+    handles: HashMap<u64, HandleEntry>, // ino -> entry
+    order: VecDeque<u64>,               // ino access order (front = oldest)
 }
 
 impl HandlePool {
@@ -592,27 +621,50 @@ impl HandlePool {
         }
     }
 
-    fn get(&mut self, ino: u64) -> Option<u64> {
-        if let Some(&file_handle) = self.handles.get(&ino) {
+    /// Increment pin_count and return the handle. Does not touch LRU order.
+    fn pin(&mut self, ino: u64) -> Option<u64> {
+        let entry = self.handles.get_mut(&ino)?;
+        entry.pin_count += 1;
+        Some(entry.file_handle)
+    }
+
+    fn unpin(&mut self, ino: u64) {
+        if let Some(entry) = self.handles.get_mut(&ino) {
+            entry.pin_count = entry.pin_count.saturating_sub(1);
+        }
+    }
+
+    /// Pin and promote to MRU. Concurrent readers stack pins on the same
+    /// entry — eviction is blocked until every pin is released.
+    fn acquire_shared(&mut self, ino: u64) -> Option<u64> {
+        let handle = self.pin(ino)?;
+        if self.order.back() != Some(&ino) {
             self.order_remove(ino);
             self.order.push_back(ino);
-            Some(file_handle)
-        } else {
-            None
         }
+        Some(handle)
+    }
+
+    /// Look up a handle without pinning. Safe only when the caller does not
+    /// yield before using the handle.
+    fn peek(&self, ino: u64) -> Option<u64> {
+        self.handles.get(&ino).map(|e| e.file_handle)
     }
 
     /// Remove an entry from the pool, returning the file handle if present.
     fn remove(&mut self, ino: u64) -> Option<u64> {
-        let file_handle = self.handles.remove(&ino)?;
+        let entry = self.handles.remove(&ino)?;
         self.order_remove(ino);
-        Some(file_handle)
+        Some(entry.file_handle)
     }
 
     /// Drain all entries, returning (ino, file_handle) pairs.
     fn drain(&mut self) -> Vec<(u64, u64)> {
         self.order.clear();
-        self.handles.drain().collect()
+        self.handles
+            .drain()
+            .map(|(ino, entry)| (ino, entry.file_handle))
+            .collect()
     }
 
     fn order_remove(&mut self, ino: u64) {
@@ -622,23 +674,45 @@ impl HandlePool {
     }
 
     /// Insert a handle. Returns evicted entries that the caller must release:
-    /// - `evicted`: LRU eviction if pool was full (different ino)
+    /// - `evicted`: LRU evictions to bring the pool back to capacity
     /// - `replaced`: old handle for the same ino (e.g. replacing read with write)
+    ///
+    /// Pinned entries (in-flight reads) are skipped during eviction. If all
+    /// entries are pinned the pool grows beyond capacity temporarily but
+    /// shrinks back on the next insert after pins are released.
     fn insert(&mut self, ino: u64, file_handle: u64) -> InsertResult {
-        let replaced = if self.handles.contains_key(&ino) {
+        let replaced = if let Some(old) = self.handles.remove(&ino) {
             self.order_remove(ino);
-            self.handles.remove(&ino)
+            Some(old.file_handle)
         } else {
             None
         };
-        let evicted = if self.handles.len() >= HANDLE_POOL_CAPACITY {
-            self.order
-                .pop_front()
-                .and_then(|old_ino| self.handles.remove(&old_ino).map(|old_fh| (old_ino, old_fh)))
-        } else {
-            None
-        };
-        self.handles.insert(ino, file_handle);
+        // Evict the strict LRU (front of order). If it is pinned, grow the
+        // pool rather than evicting a newer unpinned entry — otherwise a
+        // freshly-inserted create handle could be released before the client
+        // sends its first WRITE.
+        let mut evicted = Vec::new();
+        while self.handles.len() >= HANDLE_POOL_CAPACITY {
+            let lru_ino = match self.order.front() {
+                Some(&ino) => ino,
+                None => break,
+            };
+            let pinned = self.handles.get(&lru_ino).is_some_and(|entry| entry.pin_count != 0);
+            if pinned {
+                break;
+            }
+            self.order.pop_front();
+            if let Some(entry) = self.handles.remove(&lru_ino) {
+                evicted.push((lru_ino, entry.file_handle));
+            }
+        }
+        self.handles.insert(
+            ino,
+            HandleEntry {
+                file_handle,
+                pin_count: 0,
+            },
+        );
         self.order.push_back(ino);
         InsertResult { evicted, replaced }
     }
@@ -782,41 +856,31 @@ mod tests {
     #[test]
     fn handle_pool_basic() {
         let mut pool = HandlePool::new();
-        assert!(pool.get(1).is_none());
+        assert!(pool.peek(1).is_none());
 
         let result = pool.insert(1, 100);
-        assert!(result.evicted.is_none());
+        assert!(result.evicted.is_empty());
         assert!(result.replaced.is_none());
-        assert_eq!(pool.get(1), Some(100));
+        assert_eq!(pool.peek(1), Some(100));
     }
 
     #[test]
     fn handle_pool_lru_eviction() {
         let mut pool = HandlePool::new();
-        // Fill pool to capacity
         for i in 0..HANDLE_POOL_CAPACITY as u64 {
             pool.insert(i, i + 1000);
         }
-        // All entries present
-        assert_eq!(pool.get(0), Some(1000));
-        assert_eq!(
-            pool.get(HANDLE_POOL_CAPACITY as u64 - 1),
-            Some(1000 + HANDLE_POOL_CAPACITY as u64 - 1)
-        );
+        // Promote ino=0 to MRU so the LRU is now ino=1.
+        pool.acquire_shared(0);
+        pool.unpin(0);
 
-        // Insert one more -> evicts LRU. ino=0 was accessed last (by get above),
-        // so ino=1 (oldest untouched) should be evicted.
         let result = pool.insert(999, 9999);
-        assert!(result.evicted.is_some());
-        let (evicted_ino, evicted_fh) = result.evicted.unwrap();
-        assert_eq!(evicted_ino, 1);
-        assert_eq!(evicted_fh, 1001);
+        assert_eq!(result.evicted.len(), 1);
+        assert_eq!(result.evicted[0], (1, 1001));
         assert!(result.replaced.is_none());
 
-        // ino=1 is gone
-        assert!(pool.get(1).is_none());
-        // ino=999 is present
-        assert_eq!(pool.get(999), Some(9999));
+        assert!(pool.peek(1).is_none());
+        assert_eq!(pool.peek(999), Some(9999));
     }
 
     #[test]
@@ -827,30 +891,11 @@ mod tests {
         // Re-insert ino=1 with new handle (e.g. replacing read with write)
         let result = pool.insert(1, 101);
         assert_eq!(result.replaced, Some(100), "old handle should be returned for release");
-        assert!(result.evicted.is_none());
+        assert!(result.evicted.is_empty());
 
-        assert_eq!(pool.get(1), Some(101));
+        assert_eq!(pool.peek(1), Some(101));
         // order should have exactly 2 entries, not 3
         assert_eq!(pool.order.len(), 2);
-    }
-
-    #[test]
-    fn handle_pool_get_promotes_to_mru() {
-        let mut pool = HandlePool::new();
-        pool.insert(1, 100);
-        pool.insert(2, 200);
-        pool.insert(3, 300);
-
-        // Access ino=1 (oldest), promoting it to MRU
-        pool.get(1);
-
-        // Fill pool to capacity, then insert one more
-        for i in 4..=HANDLE_POOL_CAPACITY as u64 {
-            pool.insert(i, i * 100);
-        }
-        let result = pool.insert(999, 9999);
-        // ino=2 should be evicted (oldest after ino=1 was promoted)
-        assert_eq!(result.evicted, Some((2, 200)));
     }
 
     #[test]
@@ -861,12 +906,12 @@ mod tests {
         pool.insert(3, 300);
 
         assert_eq!(pool.remove(2), Some(200));
-        assert!(pool.get(2).is_none());
+        assert!(pool.peek(2).is_none());
         assert_eq!(pool.order.len(), 2);
         assert_eq!(pool.handles.len(), 2);
         // Remaining entries still work
-        assert_eq!(pool.get(1), Some(100));
-        assert_eq!(pool.get(3), Some(300));
+        assert_eq!(pool.peek(1), Some(100));
+        assert_eq!(pool.peek(3), Some(300));
     }
 
     #[test]
@@ -891,7 +936,88 @@ mod tests {
         let mut pool = HandlePool::new();
         pool.insert(1, 100);
         assert_eq!(pool.remove(999), None); // no-op
-        assert_eq!(pool.get(1), Some(100));
+        assert_eq!(pool.peek(1), Some(100));
         assert_eq!(pool.order.len(), 1);
+    }
+
+    #[test]
+    fn handle_pool_pinned_lru_grows_pool() {
+        let mut pool = HandlePool::new();
+        // Fill pool to capacity. ino=0 is the LRU entry.
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i + 1000);
+        }
+        // Pin ino=0 in place so the LRU is unevictable.
+        pool.pin(0);
+        assert_eq!(pool.order.front(), Some(&0));
+
+        // Insert one more — the pool grows rather than evicting a newer
+        // unpinned entry (which could be a freshly-created file's handle).
+        let result = pool.insert(999, 9999);
+        assert!(result.evicted.is_empty(), "pinned LRU should not trigger eviction");
+        assert_eq!(pool.handles.len(), HANDLE_POOL_CAPACITY + 1);
+
+        // All originals still present.
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            assert!(pool.handles.contains_key(&i));
+        }
+        pool.unpin(0);
+    }
+
+    #[test]
+    fn handle_pool_unpin_allows_eviction() {
+        let mut pool = HandlePool::new();
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i + 1000);
+        }
+        // Pin in place (no promotion), then unpin so ino=0 is evictable LRU.
+        pool.pin(0);
+        pool.unpin(0);
+        assert_eq!(pool.order.front(), Some(&0));
+
+        // ino=0 is unpinned and at the front of the order, so it evicts.
+        let result = pool.insert(999, 9999);
+        assert_eq!(result.evicted.len(), 1);
+        assert_eq!(result.evicted[0].0, 0, "unpinned LRU should evict normally");
+    }
+
+    #[test]
+    fn handle_pool_all_pinned_grows_beyond_capacity() {
+        let mut pool = HandlePool::new();
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            pool.insert(i, i + 1000);
+            pool.pin(i);
+        }
+        // All entries pinned — insert should succeed with no eviction
+        let result = pool.insert(999, 9999);
+        assert!(result.evicted.is_empty(), "no eviction when all entries are pinned");
+        assert_eq!(pool.handles.len(), HANDLE_POOL_CAPACITY + 1);
+
+        // Unpin all
+        for i in 0..HANDLE_POOL_CAPACITY as u64 {
+            pool.unpin(i);
+        }
+
+        // Next insert should reclaim overflow entries
+        let result = pool.insert(998, 9998);
+        // Should evict enough to bring pool back to capacity (evict 2: the
+        // overflow entry 999 is MRU, so oldest unpinned entries are evicted)
+        assert!(result.evicted.len() >= 2, "pool should shrink after overflow");
+        assert!(pool.handles.len() <= HANDLE_POOL_CAPACITY + 1);
+    }
+
+    #[test]
+    fn handle_pool_acquire_shared_stacks_pins() {
+        let mut pool = HandlePool::new();
+        assert!(pool.acquire_shared(1).is_none());
+
+        pool.insert(1, 100);
+        assert_eq!(pool.acquire_shared(1), Some(100));
+        assert_eq!(pool.acquire_shared(1), Some(100));
+        assert_eq!(pool.handles[&1].pin_count, 2);
+
+        pool.unpin(1);
+        pool.unpin(1);
+        assert_eq!(pool.handles[&1].pin_count, 0);
     }
 }
