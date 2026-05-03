@@ -3,16 +3,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
 use xet_data::processing::configurations::TranslatorConfig;
 use xet_data::processing::data_client::default_config;
 use xet_data::processing::{CacheConfig, FileDownloadSession, create_remote_client, get_cache};
 use xet_runtime::core::XetContext;
 
 use crate::cached_xet_client::CachedXetClient;
+use crate::file_cache::FileCache;
 use crate::hub_api::{HubApiClient, HubTokenRefresher, SourceKind, parse_repo_id, split_path_prefix};
 use crate::virtual_fs::{VfsConfig, VirtualFs};
 use crate::xet::{StagingDir, XetSessions};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheMode {
+    /// xet-core's chunk_cache: caches xorb byte ranges on disk.
+    Chunk,
+    /// hf-mount's whole-file cache: caches reconstructed files keyed by xet hash.
+    File,
+}
 
 #[derive(clap::Subcommand)]
 pub enum Source {
@@ -107,6 +116,13 @@ pub struct MountOptions {
     /// benchmarking without cache effects.
     #[arg(long, default_value_t = false)]
     pub no_disk_cache: bool,
+
+    /// Disk cache layer. `chunk` (default) uses xet-core's xorb-range cache;
+    /// `file` uses a whole-file cache addressed by xet hash, sidestepping
+    /// chunk-range fragmentation on warm reloads. The two are mutually
+    /// exclusive — selecting `file` disables the chunk cache.
+    #[arg(long, value_enum, default_value_t = CacheMode::Chunk)]
+    pub cache_mode: CacheMode,
 
     /// Bypass the kernel page cache (FOPEN_DIRECT_IO). Every read goes
     /// through the FUSE handler instead of being served from cached pages.
@@ -337,7 +353,22 @@ pub fn build_with_runtime(
     std::fs::create_dir_all(&options.cache_dir)
         .unwrap_or_else(|e| panic!("Failed to create cache dir {:?}: {e}", options.cache_dir));
 
-    let xorb_cache = if options.no_disk_cache {
+    // The chunk cache and the whole-file cache are mutually exclusive: when
+    // `cache_mode=file` we explicitly disable xet-core's chunk_cache so we
+    // don't pay disk for both layers.
+    if options.cache_mode == CacheMode::File && options.no_disk_cache {
+        warn!(
+            "--no-disk-cache overrides --cache-mode=file: both disk caches are disabled, every read \
+             will go through CAS"
+        );
+    }
+    let file_cache = if options.cache_mode == CacheMode::File && !options.no_disk_cache {
+        Some(FileCache::new(&options.cache_dir, options.cache_size).expect("Failed to create file cache"))
+    } else {
+        None
+    };
+
+    let xorb_cache = if options.no_disk_cache || file_cache.is_some() {
         None
     } else {
         let xorbs_dir = options.cache_dir.join("xorbs");
@@ -402,7 +433,7 @@ pub fn build_with_runtime(
     );
     info!(
         "Config: advanced_writes={} direct_io={} poll_interval={}s metadata_ttl={}ms \
-         cache_dir={:?} cache_size={} no_disk_cache={} max_threads={} \
+         cache_dir={:?} cache_size={} no_disk_cache={} cache_mode={:?} max_threads={} \
          flush_debounce={}ms flush_max_batch={}ms uid={} gid={} filter_os_files={}",
         advanced_writes,
         options.direct_io,
@@ -411,6 +442,7 @@ pub fn build_with_runtime(
         options.cache_dir,
         options.cache_size,
         options.no_disk_cache,
+        options.cache_mode,
         options.max_threads,
         options.flush_debounce_ms,
         options.flush_max_batch_window_ms,
@@ -426,6 +458,7 @@ pub fn build_with_runtime(
         hub_client,
         xet_sessions,
         staging_dir,
+        file_cache,
         VfsConfig {
             read_only,
             advanced_writes,
